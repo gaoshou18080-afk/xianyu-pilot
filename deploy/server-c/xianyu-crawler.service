@@ -1,0 +1,22 @@
+[Unit]
+Description=Xianyu Assistant Playwright crawler
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=guanli
+Group=guanli
+WorkingDirectory=/var/www/xianyu/apps/crawler
+EnvironmentFile=/var/www/xianyu/.env
+Environment=NODE_ENV=production
+Environment=PATH=/opt/node22/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/opt/node22/bin/node --env-file=../../.env dist/server.js
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

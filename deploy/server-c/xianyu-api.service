@@ -1,0 +1,21 @@
+[Unit]
+Description=Xianyu Assistant API
+Wants=network-online.target
+After=network-online.target mysql.service xianyu-redis.service
+
+[Service]
+Type=simple
+User=guanli
+Group=guanli
+WorkingDirectory=/var/www/xianyu/apps/api
+EnvironmentFile=/var/www/xianyu/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/var/www/xianyu/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 15177 --no-proxy-headers --no-server-header --limit-concurrency 200 --timeout-keep-alive 5
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=Xianyu Assistant scheduler worker
+Wants=network-online.target
+After=network-online.target mysql.service xianyu-redis.service
+
+[Service]
+Type=simple
+User=guanli
+Group=guanli
+WorkingDirectory=/var/www/xianyu/apps/api
+EnvironmentFile=/var/www/xianyu/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/var/www/xianyu/.venv/bin/python -m app.worker
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

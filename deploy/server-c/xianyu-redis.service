@@ -1,0 +1,22 @@
+[Unit]
+Description=Xianyu Assistant isolated Redis
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+User=redis
+Group=redis
+RuntimeDirectory=redis-xianyu
+RuntimeDirectoryMode=0750
+StateDirectory=redis-xianyu
+StateDirectoryMode=0750
+ExecStart=/usr/bin/redis-server /etc/redis/xianyu.conf --supervised systemd
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
