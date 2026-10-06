@@ -82,4 +82,6 @@
   message container，不再递归普通 `dict` 的子节点；仍支持 list 和 JSON 字符串中的对象。
 - 新增 `test_ws_protocol_nested_payload.py`，覆盖嵌套 `content` 只生成一条消息。
 - API 测试结果：`8 passed`；`compileall` 和 `git diff --check` 通过。
+- commit `8b382de` 已推送至 `gaoshou18080-afk/xianyu-pilot` fork；服务器 C 已快进更新并重启 API。
+- 重启后观察 95 秒，旧四类字段错位告警为 `0`；新消息 `id=188` 正常落库且未生成配对伪消息。
 - 后续仍需观察 WebSocket 周期性断线和无法恢复会话身份数据包的补偿策略。

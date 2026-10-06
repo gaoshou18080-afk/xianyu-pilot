@@ -55,6 +55,9 @@
 | 2026-10-06 | 检查 WebSocket 同步包 | 定位嵌套 `content` 被解析为伪消息并持续回放，已修复并通过回归测试 |
 | 2026-10-06 | 排除服务器时区影响 | C 为 `+07`；北京时间 18:48 对应服务器 17:48，AI 按 `Asia/Shanghai` 且 24 小时工作，时区不触发拦截 |
 | 2026-10-06 | 验证 18:48 消息是否落库 | 未落库；消息表最新记录仍为服务器约 17:24，确认故障发生在 WebSocket 解析入库前 |
+| 2026-10-06 | 发布 WebSocket 解析修复 | `8b382de` 推送至 fork，C 快进更新并重启 API，readiness=`ready` |
+| 2026-10-06 | 观察线上解析告警 | 重启后 95 秒内旧四类字段错位告警为 0；新消息 `id=188` 正常落库且无伪消息成对出现 |
+| 2026-10-06 | 端到端 AI 回复验证 | 待目标商品产生一条非人工接管窗口内的新买家消息 |
 
 ## 访问地址
 
@@ -99,8 +102,8 @@ tail -f output/local-dev/api.out.log
 - 服务器 C 裸机发布评估见 `docs/report/server-c-baremetal-preflight-2026-10-05.md`：当前可用内存约 399MB、Swap 为 0，最低需 4GB Swap 和 1.2GB 可用物理内存并限制 Crawler 并发为 1。
 - DNS 已切换到 `104.234.174.250`；Cloudflare 权威 NS、1.1.1.1 和 8.8.8.8
   公共解析均已确认。
-- `gaoshou18080-afk` 当前对 `dameng2026/xianyu-pilot` 没有写权限，服务器 C 部署
-  配置提交尚未推送；需要仓库授权、改用有权限的远端，或确认后推送到 fork。
+- `gaoshou18080-afk` 对 `dameng2026/xianyu-pilot` 没有写权限，已创建并推送至
+  `gaoshou18080-afk/xianyu-pilot` fork；服务器 C 已添加 `fork` 远端并从该远端发布。
 - 服务器 C 的详细运维命令见 `docs/manual.md`，本次发布记录见
   `docs/deploy.md`，上线结果见
   `docs/report/server-c-baremetal-deployment-2026-10-06.md`。
