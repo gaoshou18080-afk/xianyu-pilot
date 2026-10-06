@@ -118,15 +118,14 @@ def decrypt_payload(encrypted_data: str) -> list[dict[str, Any]]:
         decoded = base64.b64decode(cleaned)
         results: list[dict[str, Any]] = []
 
-        def _collect_dicts(value: Any):
+        def _collect_payload_objects(value: Any):
+            """Collect message containers without treating embedded JSON as messages."""
             normalized = _normalize_msgpack_value(value)
             if isinstance(normalized, dict):
                 results.append(normalized)
-                for child in normalized.values():
-                    _collect_dicts(child)
             elif isinstance(normalized, list):
                 for item in normalized:
-                    _collect_dicts(item)
+                    _collect_payload_objects(item)
             elif isinstance(normalized, str):
                 text = normalized.strip()
                 if not text:
@@ -134,7 +133,7 @@ def decrypt_payload(encrypted_data: str) -> list[dict[str, Any]]:
                 if text.startswith("{") or text.startswith("["):
                     try:
                         parsed = json.loads(text)
-                        _collect_dicts(parsed)
+                        _collect_payload_objects(parsed)
                     except Exception:
                         pass
 
@@ -143,7 +142,7 @@ def decrypt_payload(encrypted_data: str) -> list[dict[str, Any]]:
             text = decoded.decode("utf-8").strip()
             if text.startswith("{") or text.startswith("["):
                 parsed = json.loads(text)
-                _collect_dicts(parsed)
+                _collect_payload_objects(parsed)
                 if results:
                     return results
         except Exception:
@@ -154,7 +153,7 @@ def decrypt_payload(encrypted_data: str) -> list[dict[str, Any]]:
             unpacker = msgpack.Unpacker(raw=True, strict_map_key=False)
             unpacker.feed(decoded)
             for obj in unpacker:
-                _collect_dicts(obj)
+                _collect_payload_objects(obj)
             if results:
                 return results
         except Exception as exc:
@@ -165,7 +164,7 @@ def decrypt_payload(encrypted_data: str) -> list[dict[str, Any]]:
             unpacker = msgpack.Unpacker(raw=False, strict_map_key=False, use_list=False)
             unpacker.feed(decoded)
             for obj in unpacker:
-                _collect_dicts(obj)
+                _collect_payload_objects(obj)
             if results:
                 return results
         except Exception as exc:
@@ -174,7 +173,7 @@ def decrypt_payload(encrypted_data: str) -> list[dict[str, Any]]:
         # 策略三：单对象解包
         try:
             obj = msgpack.unpackb(decoded, raw=False, strict_map_key=False)
-            _collect_dicts(obj)
+            _collect_payload_objects(obj)
             if results:
                 return results
         except Exception as exc:
@@ -183,7 +182,7 @@ def decrypt_payload(encrypted_data: str) -> list[dict[str, Any]]:
         # 策略四：raw=True 单对象解包
         try:
             obj = msgpack.unpackb(decoded, raw=True, strict_map_key=False)
-            _collect_dicts(obj)
+            _collect_payload_objects(obj)
             if results:
                 return results
         except Exception:

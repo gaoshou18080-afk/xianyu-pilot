@@ -44,6 +44,18 @@
 | 2026-10-06 | 公网 HTTP/HTTPS/readiness 验收 | 通过，HTTP 301，HTTPS 200，readyz ready |
 | 2026-10-06 | 提交服务器 C 部署配置与文档 | 已本地提交，推送被 GitHub 403 拒绝 |
 
+### 线上 AI 自动回复排查
+
+| 时间 | 事项 | 状态 |
+| --- | --- | --- |
+| 2026-10-06 | 核对两个商品作用域与线上 AI 配置 | 两个商品均开启；AI 主开关为 `enabled=true` |
+| 2026-10-06 | 核对模型是否实际参与自动回复 | 线上 `ai_auto_reply_attempt` 总数为 0，从未进入模型调用 |
+| 2026-10-06 | 定位第一个商品无 AI 回复原因 | 人工接管 30 分钟策略和迟到消息保护在模型调用前拦截 |
+| 2026-10-06 | 核对第二个商品真实消息链路 | 无会话和消息，尚未形成可验证的真实请求 |
+| 2026-10-06 | 检查 WebSocket 同步包 | 定位嵌套 `content` 被解析为伪消息并持续回放，已修复并通过回归测试 |
+| 2026-10-06 | 排除服务器时区影响 | C 为 `+07`；北京时间 18:48 对应服务器 17:48，AI 按 `Asia/Shanghai` 且 24 小时工作，时区不触发拦截 |
+| 2026-10-06 | 验证 18:48 消息是否落库 | 未落库；消息表最新记录仍为服务器约 17:24，确认故障发生在 WebSocket 解析入库前 |
+
 ## 访问地址
 
 - Web：http://127.0.0.1:15176/#/login
@@ -71,6 +83,13 @@ tail -f output/local-dev/api.out.log
 3. **Playwright 浏览器版本需匹配**：`~/.cache/ms-playwright` 里预装的 chromium-1243 与 crawler 的 playwright 1.61.1 不匹配，crawler `/ready` 报 `playwright chromium executable is unavailable`。需在 `apps/crawler` 执行 `npm exec playwright install chromium` 装 v1228。
 4. **MySQL root 不可用**：`setup-local.sh` 默认用 root 建库会失败；本机 `dba_admin/123456` 具备 CREATE USER/GRANT 权限，改用 dba_admin 手工建库建用户（密码取 `.env` 中生成的 `MYSQL_PASSWORD`）。
 5. **后台进程会被会话清理**：用 `start-local.sh` 内部的 `nohup` 不够，需外层 `setsid` 启动才能脱离会话存活。
+6. **AI 配置测试不等于自动回复链路可用**：测试接口只验证模型；运行时还会经过作用域、会话暂停、迟到保护、30 分钟人工接管、额度等门禁。
+7. **会话自动恢复时间与运行时人工接管时间不一致**：会话状态机约 60 秒恢复，但策略默认仍按 30 分钟拦截。
+
+## 问题索引
+
+- AI 自动回复被人工接管/迟到保护拦截、WebSocket 字段错位：
+  见 `docs/bugs.md` 的 2026-10-06 记录。
 
 ## 待办 / 说明
 
