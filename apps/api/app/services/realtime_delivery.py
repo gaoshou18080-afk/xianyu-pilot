@@ -432,8 +432,17 @@ class SqlRealtimeDeliveryStore:
             card.realtime_attempt_id = int(attempt.id)
             card.claim_token = claim_token
             card.updated_time = _now()
-            if "{卡密}" in template or "{kmKey}" in template:
-                item_content = template.replace("{卡密}", secret).replace("{kmKey}", secret)
+            # 占位符兼容：除了 {卡密}/{kmKey}，还识别用户常写的 {卡密占位}
+            if (
+                "{卡密}" in template
+                or "{kmKey}" in template
+                or "{卡密占位}" in template
+            ):
+                item_content = (
+                    template.replace("{卡密占位}", secret)
+                    .replace("{卡密}", secret)
+                    .replace("{kmKey}", secret)
+                )
             else:
                 item_content = f"{template}\n{secret}" if template else secret
             rendered.append(item_content)

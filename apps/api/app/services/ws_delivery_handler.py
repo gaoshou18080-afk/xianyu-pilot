@@ -871,7 +871,12 @@ async def _load_goods_delivery_rule(
         if not delivery_content.strip():
             return None
     elif mode == MODE_CARD:
-        card_template = str(timing_config.get("cardTemplate") or "{卡密}")
+        # 兼容旧数据：历史配置把卡密模板写在 content 字段，cardTemplate 缺失时回退到 content
+        card_template = str(
+            timing_config.get("cardTemplate")
+            or timing_config.get("content")
+            or "{卡密}"
+        )
         delivery_content = _build_delivery_content(header, card_template, footer)
     else:
         # Persist the retired mode as failed; never read or call its URL fields.
@@ -1044,7 +1049,12 @@ async def _apply_sku_rule_override(
         if not delivery_content.strip():
             return rule
     elif mode == MODE_CARD:
-        card_template = str(timing_config.get("cardTemplate") or "{卡密}")
+        # 兼容旧数据：cardTemplate 缺失时回退到 content（SKU 覆盖场景同商品通用规则）
+        card_template = str(
+            timing_config.get("cardTemplate")
+            or timing_config.get("content")
+            or "{卡密}"
+        )
         delivery_content = _build_delivery_content(header, card_template, footer)
     else:
         delivery_content = ""
