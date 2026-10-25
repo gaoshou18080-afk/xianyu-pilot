@@ -69,6 +69,14 @@
 | 2026-10-08 | 根因 3：用户导入卡密时把 CSV 整行（含表头）当作卡密内容存到 `card_item.card_value`；第一条 id=1 是 CSV 表头，已被发货消费 | 待用户确认是否清洗剩余 8 张卡的 `card_value`（目前代码 `card_value or card_key` 优先取 value，会继续发 CSV 行而非卡号 `YF-XXXX-XXXX`） |
 | 2026-10-08 | 提交修复 `91aff94`，新增 10 个回归测试 | 已推送 fork，C 已 fast-forward 并重启 API/Worker，readiness=ready |
 
+### 货源库商品列表显示闲鱼商品ID
+
+| 时间 | 事项 | 状态 |
+| --- | --- | --- |
+| 2026-10-25 | 用户反馈：货源库「已配置商品 / 商品列表」中商品名下一行显示的是 `category`（闲鱼类目ID，如 `50023914`，所有商品相同），不是商品ID | 已定位 |
+| 2026-10-25 | 改为显示 `external_goods_id`（闲鱼 itemId，如 `1094823097374`）：API `_goods_record` 增加 `externalGoodsId`，选列增加 `g.external_goods_id`/`g.goods_id` | 已修复 |
+| 2026-10-25 | 商品搜索支持按商品ID匹配（`_goods_search_clause` 增加 `external_goods_id`/`goods_id`），前端搜索提示改为「商品标题 / 商品ID」 | 已修复 |
+
 ## 访问地址
 
 - Web：http://127.0.0.1:15176/#/login

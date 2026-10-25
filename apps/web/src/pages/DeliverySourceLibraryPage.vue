@@ -308,7 +308,7 @@
               <div v-else class="goods-thumb placeholder"></div>
               <div class="goods-main">
                 <div class="strong">{{ row.title }}</div>
-                <div class="subtle">{{ row.category || '-' }}</div>
+                <div class="subtle goods-id">商品ID：{{ row.externalGoodsId || '-' }}</div>
                 <div class="account-chip">
                   <img v-if="accountAvatar(row)" :src="accountAvatar(row)" class="account-avatar" alt="" />
                   <div v-else class="account-avatar placeholder avatar-placeholder"></div>
@@ -339,7 +339,7 @@
           <input
             v-model="goodsKeyword"
             class="input"
-            placeholder="搜索商品标题 / 分类"
+            placeholder="搜索商品标题 / 商品ID"
             style="max-width:260px"
             :disabled="detailLoading || Boolean(mutationBusy) || goodsView === 'recommend'"
             @keyup.enter="searchCandidateGoods"
@@ -394,7 +394,7 @@
               <div v-else class="goods-thumb placeholder"></div>
               <div class="goods-main">
                 <div class="strong">{{ row.title }}</div>
-                <div class="subtle">{{ row.category || '-' }}</div>
+                <div class="subtle goods-id">商品ID：{{ row.externalGoodsId || '-' }}</div>
                 <div class="account-chip">
                   <img v-if="accountAvatar(row)" :src="accountAvatar(row)" class="account-avatar" alt="" />
                   <div v-else class="account-avatar placeholder avatar-placeholder"></div>
@@ -1606,6 +1606,11 @@ onBeforeUnmount(() => {
 
 .goods-main {
   min-width: 0;
+}
+
+.goods-main .goods-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  user-select: all;
 }
 
 .account-chip {

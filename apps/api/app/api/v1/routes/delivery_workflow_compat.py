@@ -231,6 +231,7 @@ def _goods_record(row: dict[str, Any]) -> dict[str, Any]:
         "accountId": row.get("account_id"),
         "title": row.get("title") or "",
         "category": row.get("category") or "",
+        "externalGoodsId": str(row.get("external_goods_id") or row.get("goods_id") or ""),
         "status": _to_int(row.get("status"), 1),
         "coverPic": row.get("cover_pic") or "",
         "imageUrl": row.get("image_url") or "",
@@ -1140,6 +1141,8 @@ def _goods_search_clause(keyword: str, params: dict[str, Any]) -> str | None:
     return (
         "(COALESCE(g.title, '') LIKE :goods_keyword "
         "OR COALESCE(g.category, '') LIKE :goods_keyword "
+        "OR COALESCE(g.external_goods_id, '') LIKE :goods_keyword "
+        "OR COALESCE(g.goods_id, '') LIKE :goods_keyword "
         "OR COALESCE(g.description, '') LIKE :goods_keyword "
         "OR COALESCE(g.detail_info, '') LIKE :goods_keyword)"
     )
@@ -1190,6 +1193,8 @@ def _source_goods_select_sql(binding_predicate: str, where_sql: str) -> str:
         SELECT
             g.id,
             g.account_id,
+            g.goods_id,
+            g.external_goods_id,
             g.title,
             g.category,
             g.status,
