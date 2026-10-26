@@ -306,3 +306,45 @@ sh ./status-local.sh
 - `GET http://127.0.0.1:15178/ready` → 200 ready
 - `GET http://127.0.0.1:15176/` → 200
 - `POST /api/auth/login`（admin/admin123）→ 200 返回 token
+
+## 版本 `2ea1ec3` <=> 自动发货漏单修复发布 + 重新启用两个商品配置（2026-10-26）
+
+代码更新：`git pull --ff-only fork main`（`bb8faeb..2ea1ec3`）+ 重启服务。
+
+```sh
+cd /var/www/xianyu && git pull --ff-only fork main
+sudo systemctl restart xianyu-api xianyu-worker
+sudo journalctl -u xianyu-api -u xianyu-worker --since "2 min ago" --no-pager | tail -30
+```
+
+本次**非代码操作**（SQL）：把 goods 17 / 25 的付款后发货配置重新置为启用
+（10-26 11:37 被保存动作写成 `enabled=0`，代码无法自动纠偏）。
+
+```sql
+UPDATE delivery_goods_config
+SET config_json = JSON_SET(config_json, '$.payDelivery.enabled', 1),
+    updated_time = NOW()
+WHERE goods_id IN (17, 25) AND deleted = 0;
+```
+
+验证：
+
+```sql
+SELECT id, goods_id,
+       JSON_EXTRACT(config_json,'$.payDelivery.enabled') AS en,
+       JSON_EXTRACT(config_json,'$.payDelivery.mode') AS mode,
+       JSON_EXTRACT(config_json,'$.payDelivery.cardGroupId') AS cg,
+       updated_time
+FROM delivery_goods_config WHERE goods_id IN (17, 25);
+-- 期望：en=1, mode=card, cg=4
+```
+
+规则复算（服务器上只读脚本）：`resolve_realtime_delivery_rule(2, '1091821311650')`
+→ `delivery_mode=card, card_group_id=4, delivery_timing=after_payment`；
+`1094823097374` 同样命中。`1092280824859` / `1092539311888` / `1092046159577` /
+`1094895404770` 仍然 **NO RULE**（从未保存过发货配置，需人工在页面配置）。
+
+补发通道干跑（worker 每 600s 自动执行，等效）：
+`chatScanned=1 / chatSkipped=1 / chatSkippedHumanReply=6 / chatRecovered=0`
+—— 6 条因"付款后 6h 内已有卖家 OUT 消息（人工已手工发 key）"被安全阀挡下，
+1 条（`xianyu_chat_message.id=766`，goods `1094895404770` 买家 `68242230133`）因无配置跳过。
