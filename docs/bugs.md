@@ -85,3 +85,117 @@
 - commit `8b382de` 已推送至 `gaoshou18080-afk/xianyu-pilot` fork；服务器 C 已快进更新并重启 API。
 - 重启后观察 95 秒，旧四类字段错位告警为 `0`；新消息 `id=188` 正常落库且未生成配对伪消息。
 - 后续仍需观察 WebSocket 周期性断线和无法恢复会话身份数据包的补偿策略。
+
+## 2026-10-26：卡密自动发货"已启用"但付款后不发货（配置被保存动作写成停用）
+
+**现象**
+
+- 后台自动发货页显示商品 `1091821311650` 已启用卡密发货，但 09:23:14 的付款消息
+  （`xianyu_chat_message.id=869`）没有自动发货，`realtime_delivery_attempt.id=27` 落成
+  `state=failed / last_error_code=delivery_mode_unavailable`，错误文案"API/custom 发货模式已停用"，
+  日志为 `Realtime delivery no rule matched accountId=2 itemId=1091821311650`。
+- 同一商品 09:17、09:20 两笔都成功（ruleId=8，card，cardGroupId=4），说明链路本身可用。
+
+**根因（binlog 实证）**
+
+- `binlog.000165`：09:21:16（goods 17，pos 14891682）与 09:21:23（goods 25，pos 14945081）两次
+  `PUT /api/auto-delivery/goods/{id}/config` 把 `payDelivery.enabled` 从 `1` 写成 `0`，
+  JSON 其余字段（mode=card、cardGroupId=4、cardTemplate/header/content/footer 等）逐字段比对**完全一致**。
+- 即：保存请求把整份表单（含 `enabled=0`）提交上去，后端 `save_goods_delivery_config` 只做字段合并，
+  不存在后台改写逻辑。前端 `fillConfigForm` 默认 `enabled=1`，`_config` 读取路径也只读不转换，
+  最可能是弹窗内"启用/停用"下拉被误改（滚轮/键盘在 select 上滚动即可静默切换）。
+- 规则未命中时实时链路直接落 failed，不发任何提醒，用户端表现为"配置是开的但不发货"。
+
+**排查要点**
+
+- `delivery_goods_config.config_json` 里是 `{"payDelivery":{"enabled":...}}`，不是平铺的 `enabled` 字段，
+  用 `JSON_EXTRACT(config_json,'$.payDelivery.enabled')` 查。
+- `xianyu_goods`（不是 `goods`）按 `account_id + external_goods_id` 映射到本地 goods.id，
+  配置再按 goods.id 命中；商品缺失时会用订单项补建占位商品（曾产生 account 1 的重复占位 goods 28）。
+- 付款事件是否进入发货：看 `realtime_delivery_attempt`，没有新行 = WS 未判定为付款事件或消息未入库。
+
+**验证**
+
+- 只读脚本 `resolve_realtime_delivery_rule(account_id=2, external_goods_id=...)` 复算：
+  `1091821311650` → ruleId=8、`1094823097374` → ruleId=7，均 card / cardGroupId=4 / 模版 133 字；
+  `1094895404770` → 无规则（goods 16 从未保存过发货配置）。
+- 09:49:43/09:49:50 用户重新启用后，截至 10:30 无新付款事件，尚无真实下单复核。
+
+**建议**
+
+- 保存配置接口增加审计日志（goods_id、旧 `enabled`、新 `enabled`、timing），便于发现误操作。
+- 前端"启用"改为 checkbox 并加防误触，列表页显式提示"当前为停用"。
+- 无规则命中时给出前台提醒（通知/站内消息），避免静默失败。
+
+## 2026-10-26：自动发货"漏识别订单"的机制性缺口（实时通知是唯一入口 + 兜底对账失效）
+
+**机制**：付款 → WS 收到 contentType=26 的 `[我已付款，等待你发货]` 通知 → 关键词判定
+（`is_payment_message`）→ 去重（sid+item+buyer，成功 10 分钟 / 失败 1 小时）→ 命中
+`delivery_goods_config.payDelivery.enabled=1` → 取卡密 → 发消息 → 写 `delivery_record`
++ `realtime_delivery_attempt`。**没有轮询对账**，通知没到就没有任何记录。
+
+**实测（2026-10-26）**
+
+- 付款通知 12 条 ↔ `realtime_delivery_attempt` 12 条（8 成功 / 4 失败），1:1，说明"入库的通知"没漏。
+- 但会话 `68378499609` 10:52 卖家手工发密钥、有 `[我已发货]` 通知却**没有任何付款通知和 attempt** → 实证漏单。
+- `xianyu_trade_order`：account 1 有 279 条（与平台 `totalCount=279` 一致，今天仅 1 单）；
+  account 2 **一条订单都没有**，`fetch_sold_orders_page(2)` 返回 `PERMISSION_EXCEPTION::无权限访问`。
+- `delivery_recovery` 依赖 `xianyu_trade_order.pay_time` 扫描，account 2 无订单 → 兜底永远扫不到。
+- 订单号丢失：4 条失败日志均 `orderId=None`，`delivery_record.order_id` 全为 NULL
+  （付款通知的 orderId 藏在 dxCard 内层 JSON 的 `idleDeliver?orderId=` 里，`field10.reminderUrl` 拿不到）。
+- WS 被服务端每 ~40 秒断开一次，2026-10-26 当天 `接收循环连接关闭` 3034 次。
+- 应用 `logger.info` 无输出（无 logging 配置，root 默认 WARNING），漏单无日志可查。
+
+**衍生风险**
+
+- 去重键不含订单号：同一买家 10 分钟内重复买同一商品会被静默跳过。
+- 若 account 2 订单同步修好而订单号仍为 NULL，`delivery_recovery` 的
+  `r.external_order_id = o.external_order_id` 关联不上 → 已发货订单会被重复发卡。
+
+## 2026-10-26：WebSocket 每 40 秒固定断线（平台侧 35 秒会话上限）
+
+**现象**
+
+- `journalctl -u xianyu-api` 里 `WS 底层错误 ... WebSocketConnectionClosedException` +
+  `WS 接收循环连接关闭` 全天 3175 次，每账号稳定 **41 秒一轮**（40/41 秒差值占 96%）。
+- 断线无 close 帧（`code=None`，TCP 直接被丢），客户端 `_on_error` 收到
+  `Connection to remote host was lost.`。
+
+**实证（服务器 C 只读探针，脚本 `/tmp/ws_probe_*.py`，同一账号 2）**
+
+复刻 `ws_client` 连接流程（`get_ws_token` → WSS → `/reg` → `/r/SyncStatus/ackDiff` →
+心跳），6 组对照，**每次都在连接建立后 36.3±0.2 秒被断**：
+
+| 实验 | 客户端行为 | 存活 |
+|---|---|---|
+| A | 只发 15s 心跳，不发 ackDiff | 36.3s |
+| B | 收到服务端 `/!` 回 pong（带 mid） | 36.3s |
+| C | 每 5s 持续 ackDiff 轮询 + 回 pong | 36.3s |
+| E | 强制刷新 mtop token 后再连 | 36.3s |
+| F | `/!` 回带 `code=200` 的 pong | 36.5s |
+| D | 每 20s 重新 `/reg` | **24.3s（re-reg 立即被杀）** |
+
+结论：**不是心跳写错、不是 token 过期、不是 ackDiff 没轮询**，是平台对该
+`did/` 会话的下发上限 ~35 秒（服务端在 +30s 发一个 `/!`，5 秒后丢连接），
+客户端参数无法延长。附带确认：**不能周期性重新 `/reg`**，会立刻断线。
+
+**证据链（重连补偿缺失）**
+
+- 每次重连服务端在 +3s 下发一个 `/s/vulcan`，622KB、200 条，全部
+  `bizType=370 / bizType="xbroadcast"`（搜索/营销广播，JSON），**不含聊天消息**，
+  即重连后**没有聊天消息补发**；任何在 5~6 秒重连窗口内到达的付款通知永久丢失。
+- 因此每账号每天约 1587 次重连 × 6 秒 ≈ 2.6 小时（11~14%）处于断线，
+  付款消息按比例丢失（今日实证漏单：会话 `68378499609` 无付款通知、无 attempt）。
+
+**日志噪声（同源）**
+
+- `WS 未处理的消息类型 topLevelFieldCount=2` 128537 条/天：其实是心跳的裸 ACK
+  （`{"headers":{...},"code":200}`，无 `lwp`），应识别为 ACK 不要 warn。
+- `WS 消息字段不完整` 30143 条/天：122 万条/天 xbroadcast 回放包解析出的伪消息。
+
+**修复方向（未实施）**
+
+1. `RECONNECT_DELAY` 5 → 0.5~1 秒（断线率 14% → ~3%），最低成本。
+2. 预热重连：连接活到 ~30 秒即新建连接替换，实现零窗口（需验证平台是否允许短暂双连）。
+3. 兜底对账（不依赖 WS）：修 acc2 订单接口权限 + 周期订单同步，才是可靠保险。
+4. 裸 ACK 识别 + xbroadcast 回放包跳过，降低 15 万条/天日志与 CPU。

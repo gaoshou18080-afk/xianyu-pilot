@@ -69,6 +69,17 @@
 | 2026-10-08 | 根因 3：用户导入卡密时把 CSV 整行（含表头）当作卡密内容存到 `card_item.card_value`；第一条 id=1 是 CSV 表头，已被发货消费 | 待用户确认是否清洗剩余 8 张卡的 `card_value`（目前代码 `card_value or card_key` 优先取 value，会继续发 CSV 行而非卡号 `YF-XXXX-XXXX`） |
 | 2026-10-08 | 提交修复 `91aff94`，新增 10 个回归测试 | 已推送 fork，C 已 fast-forward 并重启 API/Worker，readiness=ready |
 
+### 卡密自动发货「已启用但不生效」调查（服务器 C，2026-10-26）
+
+| 时间 | 事项 | 状态 |
+| --- | --- | --- |
+| 2026-10-26 09:23 | 买家付款消息 `xianyu_chat_message.id=869`（商品 `1091821311650`）未自动发货，`realtime_delivery_attempt.id=27` = failed / `delivery_mode_unavailable`，日志 `Realtime delivery no rule matched` | 已复现 |
+| 2026-10-26 | binlog 复盘：09:21:16（goods 17）与 09:21:23（goods 25）两次后台保存把 `payDelivery.enabled` 由 1 写成 0，其余字段完全一致 | 根因 |
+| 2026-10-26 | 09:49:43 / 09:49:50 用户重新启用（enabled 0→1）；此后无新付款事件，故 09:23 之后未再验证 | 待真实订单验证 |
+| 2026-10-26 | 线上只读脚本复算规则：goods 17/25（`1094823097374`/`1091821311650`）均命中 ruleId 7/8、mode=card、cardGroupId=4、模版 133 字；卡密分组 4 可用 19 张 | 配置正确 |
+| 2026-10-26 | 商品 `1094895404770`（goods 16）从未保存过发货配置，08:37、23:13 两次失败均为 unconfigured | 需用户重配 |
+| 2026-10-26 | 建议改进：保存配置时记录 `enabled` 旧值/新值审计日志；启用开关改用 checkbox/防滚轮误改 | 待排期 |
+
 ### 货源库商品列表显示闲鱼商品ID
 
 | 时间 | 事项 | 状态 |
@@ -126,3 +137,13 @@ tail -f output/local-dev/api.out.log
   `docs/deploy.md`，上线结果见
   `docs/report/server-c-baremetal-deployment-2026-10-06.md`。
 - 仓库缺少全局约定要求的 `docs/important.md`，正式部署前需恢复或确认无遗漏决策。
+
+## WS 每 40 秒断线调查（2026-10-26）
+
+- 结论：平台侧约 35 秒会话上限，6 组只读探针复现（/var/www/xianyu 未改代码），
+  客户端参数无法延长；**禁止周期性重新 `/reg`**（会立即断线）。
+- 影响：每账号每天约 1587 次重连、11~14% 时间离线；重连只回放 xbroadcast 广播包，
+  无聊天消息补发 ⇒ 窗口内付款通知永久丢失。
+- 待决策修复优先级：① `RECONNECT_DELAY` 5→1 秒 ② 预热重连（零窗口）
+  ③ acc2 订单同步权限 + 周期对账兜底 ④ 日志降噪（裸 ACK / xbroadcast）。
+- 详见 `docs/bugs.md` 的 2026-10-26「WebSocket 每 40 秒固定断线」。

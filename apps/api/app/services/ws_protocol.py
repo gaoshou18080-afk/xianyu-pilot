@@ -19,6 +19,12 @@ import msgpack
 
 logger = logging.getLogger(__name__)
 
+# 非聊天消息的同步条目类型（不回放、不含买家消息）。
+# 370 = bizType "xbroadcast"：闲鱼搜索/营销广播包。2026-10-26 实测：每次
+# WS 重连服务端都会下发 /s/vulcan，200 条 × 全部是 370，共约 622KB，
+# 解密解析后只能得到 sId/pnmId 全空的伪消息（制造 "WS 消息字段不完整" 告警）。
+IGNORED_SYNC_BIZ_TYPES = frozenset({370})
+
 
 def _normalize_goofish_target(value: object) -> str:
     raw = str(value or "").strip()
@@ -232,8 +238,15 @@ def parse_sync_package(package: dict) -> Optional[dict]:
 
         messages = []
         ack_ids = []
+        skipped = 0
 
         for item in data_list:
+            if not isinstance(item, dict):
+                continue
+            if item.get("bizType") in IGNORED_SYNC_BIZ_TYPES:
+                # xbroadcast 等非聊天条目：跳过解密，避免每次重连解析上千条伪消息
+                skipped += 1
+                continue
             encrypted = item.get("data", "")
             if not encrypted:
                 continue
@@ -285,6 +298,13 @@ def parse_sync_package(package: dict) -> Optional[dict]:
                         "WS 消息解析失败 rawKeys=%s",
                         sorted(str(key) for key in msg_data.keys())[:30],
                     )
+
+        if skipped:
+            logger.debug(
+                "同步包跳过非聊天条目 skipped=%d lwp=%s",
+                skipped,
+                package.get("lwp", ""),
+            )
 
         return {
             "messages": messages,

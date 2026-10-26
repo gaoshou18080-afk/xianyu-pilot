@@ -47,7 +47,20 @@ logger = logging.getLogger(__name__)
 
 WS_URL = "wss://wss-goofish.dingtalk.com/"
 HEARTBEAT_INTERVAL = 15  # 心跳间隔（秒）
-RECONNECT_DELAY = 5  # 重连延迟（秒）
+# 重连延迟（秒）：平台侧会话上限约 35 秒（见 SESSION_MAX_SECONDS），
+# 原值 5 秒会让每个会话周期多损失 5 秒的入站消息（付款通知丢失）。
+# 2026-10-26 服务器 C 探针实测：建连/注册约 1.2 秒，故取 1 秒。
+RECONNECT_DELAY = 1
+# 平台会话上限（秒）：2026-10-26 六组对照探针实测，无论客户端是否持续
+# ackDiff 轮询 / 回服务端 /! 、是否刷新 token，连接建立后 36.3±0.2 秒
+# 必被服务端丢弃（无 close 帧）。因此在 32 秒时主动平滑重连，
+# 避免被动等待"硬断"。
+SESSION_MAX_SECONDS = 32
+
+# 连接/注册/Token 失败时的退避（秒）：会话到期属于正常情况用 RECONNECT_DELAY
+# 快速重连；但登录失败、滑块、注册失败必须慢重试，否则会放大风控。
+FAILURE_RETRY_BASE = 5
+FAILURE_RETRY_MAX = 60
 MESSAGE_TIMEOUT = 10  # 发送消息超时（秒）
 
 
@@ -288,6 +301,7 @@ class XianyuWebSocketClient:
         # 同步状态
         self._sync_pts = 0  # 当前同步基点时间戳
         self._sync_high_pts = 0  # 当前同步高点水印
+        self._fail_streak = 0  # 连续连接失败次数（用于指数退避）
 
         # 外部回调（如消息存储）
         self.on_message_callback = on_message_callback
@@ -664,8 +678,27 @@ class XianyuWebSocketClient:
                 )
 
             if self._running:
-                logger.info("WS 将在 %d 秒后重连 accountId=%d", RECONNECT_DELAY, self.account_id)
-                await asyncio.sleep(RECONNECT_DELAY)
+                delay = self._next_reconnect_delay()
+                logger.info(
+                    "WS 将在 %s 秒后重连 accountId=%d phase=%s",
+                    delay,
+                    self.account_id,
+                    self.phase,
+                )
+                await asyncio.sleep(delay)
+
+    def _next_reconnect_delay(self) -> float:
+        """正常会话结束快速重连，失败场景指数退避。
+
+        平台会话上限约 35 秒，每次会话结束都要尽快重连以减少消息丢失窗口；
+        而登录/注册/Token 失败属于异常，慢重试避免触发风控。
+        """
+        if self.phase in ("closed", "connected"):
+            self._fail_streak = 0
+            return float(RECONNECT_DELAY)
+        streak = int(getattr(self, "_fail_streak", 0)) + 1
+        self._fail_streak = streak
+        return float(min(FAILURE_RETRY_BASE * (2 ** (streak - 1)), FAILURE_RETRY_MAX))
 
     async def _send_and_wait(self, msg: dict[str, Any], timeout: float = MESSAGE_TIMEOUT) -> dict[str, Any]:
         if not self._connected or not self._ws:
@@ -792,7 +825,7 @@ class XianyuWebSocketClient:
             self.last_error = "获取 WebSocket Token 失败，Cookie/_m_h5_tk 可能已过期或触发滑块验证"
             self.phase = "token_failed"
             logger.error("获取 WebSocket Token 失败 accountId=%d", self.account_id)
-            await asyncio.sleep(RECONNECT_DELAY)
+            # 退避由 _connect_loop 统一处理（失败场景指数退避）
             return
 
         # === 关键：确保 cookie 中的 _m_h5_tk 与 accessToken 匹配 ===
@@ -1351,6 +1384,7 @@ class XianyuWebSocketClient:
     async def _message_loop(self, ws: _ThreadedWebSocketAdapter):
         """消息接收循环，包含心跳。"""
         heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
+        session_task = asyncio.create_task(self._session_recycle_loop(ws))
 
         try:
             while True:
@@ -1367,10 +1401,50 @@ class XianyuWebSocketClient:
             logger.warning("WS 接收循环连接关闭 accountId=%d", self.account_id)
         finally:
             heartbeat_task.cancel()
+            session_task.cancel()
             try:
                 await heartbeat_task
             except asyncio.CancelledError:
                 pass
+            try:
+                await session_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _session_recycle_loop(self, ws: _ThreadedWebSocketAdapter):
+        """平台会话到期前主动平滑重连。
+
+        实测（2026-10-26 服务器 C，6 组只读探针）：服务端在连接建立后约 35 秒
+        丢弃会话（无 close 帧，recv 抛 WebSocketConnectionClosedException）。
+        客户端参数（心跳频率、ackDiff 轮询、pong 服务端 /!、token 刷新）均
+        无法延长。被动等待"硬断"会额外损失 RECONNECT_DELAY 秒，而断线窗口内
+        到达的付款通知不会被补发（重连只回放 xbroadcast 广播包）。
+
+        因此提前 SESSION_MAX_SECONDS 主动关闭，让 _connect_loop 立刻重连。
+        """
+        try:
+            await asyncio.sleep(SESSION_MAX_SECONDS)
+            # 有在途请求（例如自动发货正在发卡密）时最多再等 2 秒，
+            # 避免打断 send/ACK 流程；平台硬断在 36 秒左右，仍有缓冲。
+            for _ in range(4):
+                if not self._send_futures:
+                    break
+                await asyncio.sleep(0.5)
+            if self._ws is ws and self._connected:
+                logger.info(
+                    "WS 会话到期前主动重连 accountId=%d lifetime=%ss",
+                    self.account_id,
+                    SESSION_MAX_SECONDS,
+                )
+                await ws.close()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug(
+                "WS 会话主动重连异常 accountId=%d errorType=%s",
+                self.account_id,
+                type(exc).__name__,
+            )
 
     async def _heartbeat_loop(self, ws: _ThreadedWebSocketAdapter):
         """心跳保活循环（15秒间隔）。"""
@@ -1500,6 +1574,19 @@ class XianyuWebSocketClient:
                         )
                         fut.set_result(result)
                 return
+
+        # === 平台裸 ACK（无 lwp、无 body，仅 code=200）===
+        # 心跳回包 {"headers":{"server-timestamp":...},"code":200}、
+        # ackDiff 回包 {"headers":{"dt","mid","sid"},"code":200} 都属于这一类。
+        # 以前落入 else 分支，每天产生约 12.8 万条 "WS 未处理的消息类型" 告警，
+        # 掩盖真正的异常。这里按 ACK 静默处理。
+        if not lwp and code == 200 and not data.get("body"):
+            logger.debug(
+                "WS 协议 ACK accountId=%d headerKeys=%s",
+                self.account_id,
+                list(headers.keys())[:6] if isinstance(headers, dict) else None,
+            )
+            return
 
         if lwp in ("/s/para", "/s/sync", "/s/vulcan", "/r/SyncStatus/ackDiff"):
             # 同步包（聊天消息/增量推送）
