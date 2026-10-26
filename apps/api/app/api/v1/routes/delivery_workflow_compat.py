@@ -3912,11 +3912,21 @@ async def trigger_delivery_recovery(
             "skipped": stats.get("skipped", 0),
             "failed": stats.get("failed", 0),
             "details": stats.get("details", []),
+            "chatScanned": stats.get("chatScanned", 0),
+            "chatRecovered": stats.get("chatRecovered", 0),
+            "chatSkipped": stats.get("chatSkipped", 0),
+            "chatFailed": stats.get("chatFailed", 0),
+            "chatSkippedHumanReply": stats.get("chatSkippedHumanReply", 0),
+            "chatDetails": stats.get("chatDetails", []),
             "message": (
                 f"补发扫描完成：扫描 {stats.get('scanned', 0)} 单，"
                 f"补发 {stats.get('recovered', 0)} 单，"
                 f"跳过 {stats.get('skipped', 0)} 单，"
-                f"失败 {stats.get('failed', 0)} 单"
+                f"失败 {stats.get('failed', 0)} 单；"
+                f"付款消息补发通道：扫描 {stats.get('chatScanned', 0)} 条，"
+                f"补发 {stats.get('chatRecovered', 0)} 条，"
+                f"人工已回复跳过 {stats.get('chatSkippedHumanReply', 0)} 条，"
+                f"无配置等问题跳过 {stats.get('chatSkipped', 0)} 条"
             ),
         }
     )
