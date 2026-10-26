@@ -10,7 +10,7 @@ import time
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.database import async_session
@@ -22,6 +22,7 @@ from .realtime_delivery import (
     XianyuRealtimeDeliveryGateway,
     build_realtime_delivery_event_key,
 )
+from .payment_order_id import extract_order_id_from_message
 from .ws_client import ws_manager
 
 
@@ -462,7 +463,13 @@ async def _process_delivery(
 ) -> RealtimeDeliveryOutcome | None:
     session_id = str(msg.get("sId") or msg.get("sid") or "").strip()
     reminder_url = str(msg.get("reminderUrl") or msg.get("reminder_url") or "")
-    external_order_id = extract_order_id_from_url(reminder_url)
+    # 订单号优先取解析出来的 orderId（付款卡片 dxCard 内层 JSON 才有），
+    # reminderUrl 通常不带 orderId，只作为兜底。
+    external_order_id = (
+        str(msg.get("orderId") or msg.get("order_id") or "").strip()
+        or extract_order_id_from_message(msg)
+        or extract_order_id_from_url(reminder_url)
+    )
     item_id = str(msg.get("xyGoodsId") or "").strip()
     if not item_id:
         item_id = extract_goods_id_from_url(reminder_url) or ""
@@ -511,12 +518,23 @@ async def _process_delivery(
         item_id=item_id,
     )
 
-    # 数据库层去重第一道防线：查询 delivery_record 表（包括失败记录 1 小时窗口）
-    # 防止 event_key 不同但实际是同一发货场景的重复触发（事故级 Bug 修复）
-    if await _has_existing_realtime_delivery(db, account_id, session_id, item_id, peer_id):
+    # 数据库层去重第一道防线：按订单号查 realtime_delivery_attempt（订单维度最可靠），
+    # 没有订单号时退化成"会话 + 商品 + 买家 + 时间窗"。
+    # 背景：旧实现查 delivery_record.receiver_info 里的 sid/xyGoodsId/buyerUserId，
+    # 但实时发货写库时 receiver_info 只有 {"realtimeAttemptId": N}，该查询永远命中 0 行，
+    # 等于这层防线失效。
+    duplicate_reason = await _find_duplicate_delivery(
+        db,
+        account_id=account_id,
+        external_order_id=external_order_id,
+        session_id=session_id,
+        item_id=item_id,
+        peer_id=peer_id,
+    )
+    if duplicate_reason:
         logger.info(
-            "数据库层去重命中，跳过发货 accountId=%d orderId=%s itemId=%s sid=%s",
-            account_id, external_order_id, item_id, session_id[:32],
+            "去重命中，跳过发货 accountId=%d orderId=%s itemId=%s sid=%s reason=%s",
+            account_id, external_order_id, item_id, session_id[:32], duplicate_reason,
         )
         return None
 
@@ -534,9 +552,10 @@ async def _process_delivery(
         external_goods_id=item_id,
     )
     if not rule:
+        reason = await _diagnose_missing_rule(db, account_id, item_id)
         logger.warning(
-            "Realtime delivery no rule matched accountId=%d itemId=%s orderId=%s",
-            account_id, item_id, external_order_id,
+            "Realtime delivery no rule matched accountId=%d itemId=%s orderId=%s reason=%s",
+            account_id, item_id, external_order_id, reason,
         )
     else:
         logger.info(
@@ -685,6 +704,54 @@ async def _match_delivery_rule(
     # 自动确认发货仅在 delivery_goods_config（新版配置）路径下生效。
     rule["auto_confirm_shipment"] = 0
     return rule
+
+
+async def _diagnose_missing_rule(
+    db: AsyncSession,
+    account_id: int,
+    external_goods_id: str,
+) -> str:
+    """规则未匹配时给出可读原因，避免"我明明启用了却静默不发货"。
+
+    返回：goods_not_found / config_missing / config_disabled /
+    mode_unsupported / card_group_missing / legacy_rule_missing / unknown
+    """
+
+    try:
+        goods = await _find_goods_for_delivery(db, account_id, external_goods_id)
+        if not goods:
+            return "goods_not_found"
+        row = (
+            await db.execute(
+                text(
+                    """
+                    SELECT config_json
+                    FROM delivery_goods_config
+                    WHERE goods_id = :goods_id
+                      AND deleted = 0
+                    LIMIT 1
+                    """
+                ),
+                {"goods_id": goods.get("id")},
+            )
+        ).mappings().first()
+        if not row:
+            return "config_missing"
+        config = _json_object(row.get("config_json"))
+        timing_config = config.get("payDelivery")
+        if not isinstance(timing_config, dict):
+            return "config_missing"
+        if not _truthy(timing_config.get("enabled")):
+            return "config_disabled"
+        mode = _normalize_delivery_mode(timing_config.get("mode"))
+        if mode not in {MODE_TEXT, MODE_CARD}:
+            return "mode_unsupported"
+        if mode == MODE_CARD and not _optional_int(timing_config.get("cardGroupId")):
+            return "card_group_missing"
+        return "unknown"
+    except Exception:  # noqa: BLE001 - 诊断失败不影响主流程
+        logger.debug("发货规则诊断失败 accountId=%d itemId=%s", account_id, external_goods_id, exc_info=True)
+        return "unknown"
 
 
 async def _find_goods_for_delivery(
@@ -1379,75 +1446,109 @@ async def _trigger_delivery_for_confirmed_statement(
 # ==================== 商业版同步：数据库层去重保护 ====================
 
 
-async def _has_existing_realtime_delivery(
+def _normalize_identity(value: Any) -> str:
+    return str(value or "").strip().removesuffix("@goofish")
+
+
+async def _find_duplicate_delivery(
     db: AsyncSession,
+    *,
     account_id: int,
+    external_order_id: str,
     session_id: str,
     item_id: str,
     peer_id: str,
-) -> bool:
-    """数据库层去重：查询 delivery_record 表判断是否已有发货记录。
+) -> str:
+    """发货去重：命中返回原因字符串，未命中返回空串。
 
-    双层时间窗口（事故级 Bug 修复）：
-    - 成功记录（status IN 1,2）：10 分钟窗口内视为重复
-    - 失败记录（status=3）：1 小时窗口内视为重复，避免 WS 周期性推送导致死循环
-
-    Args:
-        db: 数据库会话
-        account_id: 闲鱼账号ID
-        session_id: 会话ID（已归一化去 @goofish 后缀）
-        item_id: 商品ID
-        peer_id: 买家ID
-
-    Returns:
-        True 表示已有发货记录，应跳过本次发货
+    两级判据：
+    1. 有订单号（orderId）→ 直接查 ``realtime_delivery_attempt`` 订单维度记录。
+       订单是唯一身份，同买家复购不同订单不会被误判重复。
+       - state=success/unknown/message_sent/message_sending/platform_confirming → 跳过
+       - state=failed 且 retry_safe=1 → 不拦截（交给状态机重试）
+       - state=failed 且 retry_safe=0 → 拦截（配置/内容类失败，需先修配置）
+       - state=superseded → 忽略（旧配置时代的作废尝试）
+    2. 没有订单号 → 退化为"会话 + 商品 + 买家"10 分钟窗口，避免 WS 周期推送重复发货。
     """
-    if not session_id or not item_id or not peer_id:
-        return False
-
-    # 归一化 sid：去掉 @goofish 后缀
-    normalized_sid = str(session_id).removesuffix("@goofish")
-
-    # 查询 delivery_record 表，按 receiver_info JSON 中的 sid/buyerUserId/xyGoodsId 匹配
-    # 双层时间窗口：成功记录 10 分钟 / 失败记录 1 小时
-    query = text("""
-        SELECT COUNT(*) AS cnt
-        FROM delivery_record
-        WHERE account_id = :account_id
-          AND deleted = 0
-          AND delivery_timing = 'after_payment'
-          AND (
-            (status IN (1, 2) AND created_time >= DATE_SUB(NOW(), INTERVAL 10 MINUTE))
-            OR
-            (status = 3 AND created_time >= DATE_SUB(NOW(), INTERVAL 1 HOUR))
-          )
-          AND (
-            JSON_EXTRACT(receiver_info, '$.sid') = :sid
-            OR JSON_EXTRACT(receiver_info, '$.sId') = :sid
-          )
-          AND JSON_EXTRACT(receiver_info, '$.xyGoodsId') = :item_id
-          AND (
-            JSON_EXTRACT(receiver_info, '$.buyerUserId') = :peer_id
-            OR JSON_EXTRACT(receiver_info, '$.buyerId') = :peer_id
-          )
-    """)
 
     try:
-        result = await db.execute(query, {
-            "account_id": account_id,
-            "sid": normalized_sid,
-            "item_id": str(item_id),
-            "peer_id": str(peer_id),
-        })
-        count = result.scalar() or 0
-        return count > 0
+        if external_order_id:
+            row = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT id, state, retry_safe
+                        FROM realtime_delivery_attempt
+                        WHERE account_id = :account_id
+                          AND external_order_id = :order_id
+                          AND state <> 'superseded'
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """
+                    ),
+                    {
+                        "account_id": int(account_id),
+                        "order_id": str(external_order_id),
+                    },
+                )
+            ).mappings().first()
+            if row is None:
+                return ""
+            state = str(row.get("state") or "")
+            if state == "failed":
+                if int(row.get("retry_safe") or 0) == 1:
+                    return ""
+                return "order_attempt_failed_not_retryable"
+            return f"order_attempt_state_{state or 'unknown'}"
+
+        if not session_id or not item_id or not peer_id:
+            return ""
+
+        sid_variants = {str(session_id).strip(), _normalize_identity(session_id)}
+        peer_variants = {str(peer_id).strip(), _normalize_identity(peer_id)}
+        row = (
+            await db.execute(
+                text(
+                    """
+                    SELECT id, state
+                    FROM realtime_delivery_attempt
+                    WHERE account_id = :account_id
+                      AND item_id = :item_id
+                      AND state <> 'superseded'
+                      AND (
+                        session_id IN :sids
+                        OR REPLACE(session_id, '@goofish', '') IN :sids
+                      )
+                      AND (
+                        peer_id IN :peers
+                        OR REPLACE(peer_id, '@goofish', '') IN :peers
+                      )
+                      AND created_time >= DATE_SUB(NOW(), INTERVAL 10 MINUTE)
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """
+                ).bindparams(
+                    bindparam("sids", expanding=True),
+                    bindparam("peers", expanding=True),
+                ),
+                {
+                    "account_id": int(account_id),
+                    "item_id": str(item_id),
+                    "sids": list(sid_variants),
+                    "peers": list(peer_variants),
+                },
+            )
+        ).mappings().first()
+        if row is None:
+            return ""
+        return f"session_attempt_state_{row.get('state') or 'unknown'}"
     except Exception as exc:
         logger.warning(
-            "数据库层去重查询失败，降级为不跳过 accountId=%d errorType=%s",
+            "发货去重查询失败，降级为不跳过 accountId=%d errorType=%s",
             account_id,
             type(exc).__name__,
         )
-        return False
+        return ""
 
 
 async def _check_order_already_shipped(

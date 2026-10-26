@@ -789,11 +789,27 @@ def parse_numbered_fields(data: dict) -> Optional[dict]:
         list(msg_info.keys())[:30] if isinstance(msg_info, dict) else [],
     )
 
+    # 付款卡片（contentType=26）里的订单号：reminderUrl 不带 orderId，
+    # 订单号藏在 dxCard 内层 JSON / extJson.updateKey 中，必须解析出来，
+    # 否则发货幂等只能按消息事件键（同买家复购无法区分）。
+    from .payment_order_id import extract_order_id_from_payload
+
+    order_id = ""
+    try:
+        order_id = extract_order_id_from_payload(data)
+    except Exception:  # noqa: BLE001 - 解析失败绝不影响消息入库
+        logger.debug("WS 订单号解析失败 msgType=%s", msg_type, exc_info=True)
+    if not order_id and reminder_url:
+        from .payment_order_id import extract_order_id_from_text
+
+        order_id = extract_order_id_from_text(reminder_url)
+
     return {
         "sId": str(s_id) if s_id else "",
         "pnmId": str(pnm_id) if pnm_id else "",
         "senderUserId": str(sender_user_id) if sender_user_id else "",
         "senderUserName": str(sender_user_name) if sender_user_name else "",
+        "orderId": order_id,
         "messageTime": int(message_time) if str(message_time).isdigit() else 0,
         "msgContent": msg_content,
         "contentType": content_type,

@@ -35,7 +35,15 @@ from .realtime_delivery import (
     XianyuRealtimeDeliveryGateway,
     build_realtime_delivery_event_key,
 )
-from .ws_delivery_handler import resolve_realtime_delivery_rule, _render_delivery_content
+from .payment_order_id import (
+    extract_order_id_from_message,
+    extract_order_id_from_payload,
+)
+from .ws_delivery_handler import (
+    _process_delivery,
+    _render_delivery_content,
+    resolve_realtime_delivery_rule,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +55,15 @@ _ALREADY_SENT_STATES = (
     "message_sent",
     "message_sending",
     "platform_confirming",
+    "pending",
+)
+
+# 这些失败发生在"发消息之前"（配置/内容问题），修好配置后可以安全重发。
+# 其余失败（尤其是发送后未知）一律不自动重试。
+_PRE_SEND_FAILURE_CODES = (
+    "delivery_mode_unavailable",
+    "card_group_missing",
+    "delivery_content_empty",
 )
 
 
@@ -369,6 +386,325 @@ async def _recover_one_order(
     return await coordinator.execute(command)
 
 
+async def _find_pending_payment_messages(
+    db: AsyncSession,
+    *,
+    lookback_hours: int,
+    min_age_seconds: int,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """扫描 WS 落库的"已付款"卡片消息，找出还没发货的单子。
+
+    为什么需要这条通道（2026-10-26 线上结论）：
+    - 账号 2（美丽妈咪飞舞青春）的「已售出订单」接口返回
+      ``PERMISSION_EXCEPTION::无权限访问``，``xianyu_trade_order`` 一条都没有，
+      只靠订单表补发的 ``_find_pending_delivery_orders`` 永远扫不到它；
+    - 但付款事件的 WS 卡片消息（contentType=26）是实打实入库的，
+      里面有 sid / itemId / 买家 / 订单号（dxCard 内层 JSON），足够补发。
+
+    因此这里直接以聊天消息为准做兜底补发：配置停用期间漏掉的单、
+    卡密库存不足、WS / 进程重启期间的失败，都能在配置修好后自动补上。
+    """
+
+    rows = (
+        await db.execute(
+            text(
+                """
+                SELECT m.id AS message_id,
+                       m.account_id,
+                       m.s_id,
+                       m.pnm_id,
+                       m.message_uid,
+                       m.sender_user_id,
+                       m.sender_user_name,
+                       m.xy_goods_id,
+                       m.reminder_content,
+                       m.reminder_url,
+                       m.complete_msg,
+                       m.raw_payload,
+                       m.message_time,
+                       m.created_time
+                FROM xianyu_chat_message m
+                INNER JOIN xianyu_account acc
+                  ON acc.id = m.account_id
+                 AND acc.status = 1
+                 AND acc.deleted = 0
+                WHERE m.deleted = 0
+                  AND m.direction = 'IN'
+                  AND m.content_type = 26
+                  AND m.reminder_content LIKE '%已付款%'
+                  AND m.created_time >= DATE_SUB(NOW(), INTERVAL :lookback_hours HOUR)
+                  AND m.created_time <= DATE_SUB(NOW(), INTERVAL :min_age_seconds SECOND)
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM realtime_delivery_attempt a
+                    WHERE a.account_id = m.account_id
+                      AND a.state IN (
+                        'success', 'unknown', 'message_sent',
+                        'message_sending', 'platform_confirming', 'pending'
+                      )
+                      AND (
+                        a.source_event_id IN (m.pnm_id, m.message_uid)
+                      )
+                  )
+                ORDER BY m.id DESC
+                LIMIT :limit
+                """
+            ),
+            {
+                "lookback_hours": int(lookback_hours),
+                "min_age_seconds": int(min_age_seconds),
+                "limit": int(limit),
+            },
+        )
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+def _message_from_chat_row(row: dict[str, Any]) -> dict[str, Any]:
+    """把聊天消息行还原成发货处理器认识的 WS 消息字典。"""
+
+    complete_msg = row.get("complete_msg")
+    if isinstance(complete_msg, str):
+        try:
+            import json as _json
+
+            parsed = _json.loads(complete_msg)
+            if isinstance(parsed, dict):
+                complete_msg = parsed
+        except (ValueError, TypeError):
+            complete_msg = None
+
+    msg: dict[str, Any] = {
+        "sId": row.get("s_id") or "",
+        "pnmId": row.get("pnm_id") or row.get("message_uid") or "",
+        "senderUserId": row.get("sender_user_id") or "",
+        "senderUserName": row.get("sender_user_name") or "",
+        "xyGoodsId": row.get("xy_goods_id") or "",
+        "reminderContent": row.get("reminder_content") or "",
+        "reminderUrl": row.get("reminder_url") or "",
+        "contentType": 26,
+        "direction": "IN",
+        "messageTime": int(row.get("message_time") or 0),
+        "recoverySource": f"chat_message:{row.get('message_id')}",
+    }
+    if isinstance(complete_msg, dict):
+        msg["complete_msg"] = complete_msg
+        # 复用实时链路的解析结果（订单号、原始字段树都在里面）
+        for key in ("orderId", "xyGoodsId", "sId", "pnmId", "senderUserId"):
+            if not msg.get(key) and complete_msg.get(key):
+                msg[key] = complete_msg[key]
+    if not msg.get("orderId") and row.get("raw_payload"):
+        # complete_msg 可能是旧版本落库（还没解析出 orderId），退回原始字段树再解析一次
+        raw_order_id = extract_order_id_from_payload(row.get("raw_payload"))
+        if raw_order_id:
+            msg["orderId"] = raw_order_id
+    order_id = extract_order_id_from_message(msg)
+    if order_id:
+        msg["orderId"] = order_id
+    return msg
+
+
+async def _find_related_attempts(
+    db: AsyncSession,
+    *,
+    account_id: int,
+    order_id: str,
+    source_event_ids: list[str],
+) -> list[dict[str, Any]]:
+    if not order_id and not source_event_ids:
+        return []
+    placeholders = ", ".join(f":e{i}" for i in range(len(source_event_ids)))
+    conditions = []
+    params: dict[str, Any] = {"account_id": int(account_id)}
+    if order_id:
+        conditions.append("external_order_id = :order_id")
+        params["order_id"] = order_id
+    if source_event_ids:
+        conditions.append(f"source_event_id IN ({placeholders})")
+        for index, value in enumerate(source_event_ids):
+            params[f"e{index}"] = value
+    rows = (
+        await db.execute(
+            text(
+                f"""
+                SELECT id, state, retry_safe, last_error_code, external_order_id
+                FROM realtime_delivery_attempt
+                WHERE account_id = :account_id
+                  AND ({' OR '.join(conditions)})
+                  AND state <> 'superseded'
+                ORDER BY id DESC
+                """
+            ),
+            params,
+        )
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+async def _supersede_attempt(db: AsyncSession, attempt_id: int) -> None:
+    """把旧配置时代的失败尝试作废，让同一订单可以重新走一次状态机。
+
+    只用于"发消息之前就失败"的场景（配置停用、无卡密分组等），
+    不会重发已发出消息的订单。
+    """
+
+    await db.execute(
+        text(
+            """
+            UPDATE realtime_delivery_attempt
+            SET event_key = CONCAT('sup:', id, ':', LEFT(event_key, 48)),
+                state = 'superseded',
+                retry_scope = 'superseded',
+                retry_safe = 0,
+                lease_token = NULL,
+                lease_until = NULL,
+                updated_time = NOW()
+            WHERE id = :attempt_id
+            """
+        ),
+        {"attempt_id": int(attempt_id)},
+    )
+    logger.info("delivery_recovery superseded attempt id=%d", attempt_id)
+
+
+async def _recover_one_payment_message(
+    db: AsyncSession,
+    row: dict[str, Any],
+) -> RealtimeDeliveryOutcome | None:
+    """对一条付款卡片消息做兜底补发。返回 None 表示跳过。"""
+
+    account_id = int(row.get("account_id") or 0)
+    item_id = str(row.get("xy_goods_id") or "").strip()
+    session_id = str(row.get("s_id") or "").strip()
+    peer_id = str(row.get("sender_user_id") or "").strip()
+    message_id = row.get("message_id")
+    if account_id <= 0 or not item_id or not session_id or not peer_id:
+        logger.info(
+            "delivery_recovery skip message=%s missing identity accountId=%d itemId=%s sid=%s peer=%s",
+            message_id, account_id, item_id, session_id, peer_id,
+        )
+        return None
+
+    msg = _message_from_chat_row(row)
+    order_id = str(msg.get("orderId") or "")
+
+    source_event_ids = [
+        value
+        for value in {
+            str(row.get("pnm_id") or "").strip(),
+            str(row.get("message_uid") or "").strip(),
+        }
+        if value
+    ]
+    attempts = await _find_related_attempts(
+        db,
+        account_id=account_id,
+        order_id=order_id,
+        source_event_ids=source_event_ids,
+    )
+    superseded_ids: list[int] = []
+    retryable = False
+    for attempt in attempts:
+        state = str(attempt.get("state") or "")
+        error_code = str(attempt.get("last_error_code") or "")
+        if state in _ALREADY_SENT_STATES:
+            logger.debug(
+                "delivery_recovery skip message=%s attempt=%s state=%s (already handled)",
+                message_id, attempt.get("id"), state,
+            )
+            return None
+        if state == "failed":
+            if int(attempt.get("retry_safe") or 0) == 1:
+                retryable = True
+                continue
+            if error_code in _PRE_SEND_FAILURE_CODES:
+                superseded_ids.append(int(attempt.get("id")))
+                retryable = True
+                continue
+        # 其他状态（含 message_sent 之外的异常态）一律不动
+        if state not in ("failed",):
+            logger.debug(
+                "delivery_recovery skip message=%s attempt=%s state=%s (unknown state)",
+                message_id, attempt.get("id"), state,
+            )
+            return None
+
+    rule = await resolve_realtime_delivery_rule(
+        db,
+        account_id=account_id,
+        external_goods_id=item_id,
+    )
+    if not rule:
+        # 商品没配置 / 配置停用 / 模式不支持：本消息跳过，等配置修好后下一轮再补
+        logger.debug(
+            "delivery_recovery skip message=%s no rule accountId=%d itemId=%s",
+            message_id, account_id, item_id,
+        )
+        return None
+    if not retryable and attempts:
+        # 有尝试记录但既不是失败可重试，也没有可作废的前置失败 → 不动
+        return None
+
+    for attempt_id in superseded_ids:
+        await _supersede_attempt(db, attempt_id)
+
+    logger.info(
+        "delivery_recovery retry payment message=%s accountId=%d orderId=%s itemId=%s sid=%s superseded=%s",
+        message_id, account_id, order_id or "-", item_id, session_id[:20], superseded_ids,
+    )
+    return await _process_delivery(db, account_id, msg)
+
+
+async def _run_chat_message_recovery(
+    *,
+    lookback_hours: int,
+    min_age_seconds: int,
+    limit: int,
+) -> dict[str, Any]:
+    """按付款卡片消息补发一轮，返回统计。"""
+
+    stats = {"scanned": 0, "recovered": 0, "skipped": 0, "failed": 0, "details": []}
+    async with async_session() as db:
+        rows = await _find_pending_payment_messages(
+            db,
+            lookback_hours=lookback_hours,
+            min_age_seconds=min_age_seconds,
+            limit=limit,
+        )
+    stats["scanned"] = len(rows)
+    for row in rows:
+        try:
+            async with async_session() as db:
+                outcome = await _recover_one_payment_message(db, row)
+                if outcome is None:
+                    await db.rollback()
+                    stats["skipped"] += 1
+                    continue
+                await db.commit()
+            stats["recovered"] += 1
+            stats["details"].append(
+                {
+                    "messageId": row.get("message_id"),
+                    "attemptId": outcome.attempt_id,
+                    "status": outcome.status,
+                    "errorCode": outcome.error_code,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            stats["failed"] += 1
+            stats["details"].append(
+                {"messageId": row.get("message_id"), "error": f"{type(exc).__name__}: {exc}"}
+            )
+            logger.error(
+                "delivery_recovery chat message=%s errorType=%s",
+                row.get("message_id"),
+                type(exc).__name__,
+                exc_info=True,
+            )
+    return stats
+
+
 async def _resurrect_dead_letter_attempts(db: AsyncSession, *, max_age_hours: int = 24) -> int:
     """Revive attempts stuck in 'unknown' state for too long.
 
@@ -458,9 +794,6 @@ async def run_delivery_recovery_once(
             limit=batch_size,
         )
     stats["scanned"] = len(orders)
-    if not orders:
-        return stats
-
     for order in orders:
         order_id = order.get("order_id")
         try:
@@ -497,6 +830,30 @@ async def run_delivery_recovery_once(
                 type(exc).__name__,
                 exc_info=True,
             )
+
+    # 第二通道：按付款卡片消息补发（不依赖「已售出订单」接口，
+    # 账号 2 该接口无权限，订单表为空，只能靠这条通道兜底）
+    if settings.delivery_recovery_chat_enabled:
+        try:
+            chat_stats = await _run_chat_message_recovery(
+                lookback_hours=int(settings.delivery_recovery_chat_lookback_hours),
+                min_age_seconds=min_age,
+                limit=int(settings.delivery_recovery_chat_batch_size),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "delivery_recovery chat channel failed errorType=%s",
+                type(exc).__name__,
+                exc_info=True,
+            )
+            chat_stats = {"scanned": 0, "recovered": 0, "skipped": 0, "failed": 1}
+        stats["chatScanned"] = chat_stats.get("scanned", 0)
+        stats["chatRecovered"] = chat_stats.get("recovered", 0)
+        stats["chatSkipped"] = chat_stats.get("skipped", 0)
+        stats["chatFailed"] = chat_stats.get("failed", 0)
+        if chat_stats.get("recovered") or chat_stats.get("failed"):
+            stats["chatDetails"] = chat_stats.get("details", [])
+            logger.info("delivery_recovery chat batch: %s", chat_stats)
 
     return stats
 

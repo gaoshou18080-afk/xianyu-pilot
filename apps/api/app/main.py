@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from urllib.parse import quote
 from fastapi import FastAPI, Request
@@ -43,6 +44,30 @@ from app.core.upload_security import (
 from app.migrations import assert_schema_current, get_schema_status
 
 install_log_redaction()
+
+
+def _configure_logging_once() -> None:
+    """让应用日志（INFO）能进 journald。
+
+    背景：API 由 uvicorn 直接拉起，没有 basicConfig，root logger 默认 WARNING，
+    于是 ``ws_delivery_handler`` / ``delivery_recovery`` 里的 INFO 日志
+    （发货命中、去重命中、补发统计）在 ``journalctl -u xianyu-api`` 里完全看不到，
+    线上排障只能看到零星 WARNING/ERROR。
+    """
+
+    level_name = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+    level = getattr(logging, level_name, logging.INFO)
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        )
+    root.setLevel(level)
+
+
+_configure_logging_once()
+
 logger = logging.getLogger(__name__)
 UPLOADS_DIR = settings.uploads_path
 

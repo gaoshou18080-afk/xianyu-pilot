@@ -82,6 +82,12 @@ class Settings(BaseSettings):
     delivery_recovery_batch_size: int = 50
     # 订单付款后至少等待该秒数才允许补发，避免与 WS 实时事件抢资源。
     delivery_recovery_min_age_seconds: int = 300
+    # 聊天消息兜底补发：不依赖「已售出订单」接口（部分账号该接口无权限），
+    # 直接扫描 WS 落库的付款卡片消息，把没发出去的单子补上。
+    delivery_recovery_chat_enabled: bool = True
+    # 首次上线只回看 12 小时，避免把「已经人工手动发过卡」的老单再补一遍。
+    delivery_recovery_chat_lookback_hours: int = 12
+    delivery_recovery_chat_batch_size: int = 20
 
     # 内部调用令牌。Phase 1 起内部接口 fail-closed：为空时拒绝内部调用。
     internal_api_token: str = Field(
@@ -324,6 +330,14 @@ class Settings(BaseSettings):
         if not 0 <= self.delivery_recovery_min_age_seconds <= 86_400:
             raise ValueError(
                 "DELIVERY_RECOVERY_MIN_AGE_SECONDS must be between 0 and 86400"
+            )
+        if not 1 <= self.delivery_recovery_chat_lookback_hours <= 168:
+            raise ValueError(
+                "DELIVERY_RECOVERY_CHAT_LOOKBACK_HOURS must be between 1 and 168"
+            )
+        if not 1 <= self.delivery_recovery_chat_batch_size <= 100:
+            raise ValueError(
+                "DELIVERY_RECOVERY_CHAT_BATCH_SIZE must be between 1 and 100"
             )
         if not 1 <= self.audit_log_retention_days <= 3650:
             raise ValueError("AUDIT_LOG_RETENTION_DAYS must be between 1 and 3650")

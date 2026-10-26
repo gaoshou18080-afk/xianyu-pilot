@@ -147,3 +147,26 @@ tail -f output/local-dev/api.out.log
 - 待决策修复优先级：① `RECONNECT_DELAY` 5→1 秒 ② 预热重连（零窗口）
   ③ acc2 订单同步权限 + 周期对账兜底 ④ 日志降噪（裸 ACK / xbroadcast）。
 - 详见 `docs/bugs.md` 的 2026-10-26「WebSocket 每 40 秒固定断线」。
+
+## 自动发货漏单修复（2026-10-26 第二轮，已发布）
+
+- 提交内容（本次）：
+  1. `services/payment_order_id.py`（新增）：从付款卡片 rawPayload 解析真实订单号；
+  2. `ws_protocol` / `ws_delivery_handler`：消息体带 `orderId`，attempt/record 记录订单号；
+  3. 去重防线重写为 `_find_duplicate_delivery`（原实现查 `receiver_info` 是死代码）；
+  4. `_diagnose_missing_rule`：无规则命中时日志给 `reason=config_disabled` 等可读原因；
+  5. `delivery_recovery` 新增「按付款卡片消息补发」通道（acc2 无订单接口权限的兜底），
+     worker 每 600s 跑一轮，默认回看 12 小时、每轮 20 条；
+  6. `main.py` 配 `basicConfig`，INFO 日志进 journald。
+- 发布步骤：本地测试 31 passed → commit → push `fork main` → 服务器
+  `git pull --ff-only fork main` + `systemctl restart xianyu-api xianyu-worker`。
+- **需要人工操作**：在「自动发货」页面给 goods 17(`1094823097374`) / 25(`1091821311650`) 重新选
+  「启用」并保存；其余在售商品（`1092539311888`、`1092046159577`、`1092280824859`、`1094895404770`）
+  需先保存一份卡密发货配置，否则永远是 `reason=config_missing`。
+- 观测手段：
+  - `journalctl -u xianyu-api -u xianyu-worker --since "10 min ago" | grep -E "reason=|delivery_recovery|订单号"`
+  - `select id,external_order_id,state,last_error_code from realtime_delivery_attempt where created_time>=CURDATE() order by id desc limit 20;`
+    预期 `external_order_id` 非空。
+- 风险：回看窗口内的老单会被补发一次（系统看不到"人工在闲鱼 App 手工发货"的动作），
+  必要时调 `DELIVERY_RECOVERY_CHAT_LOOKBACK_HOURS` 或 `DELIVERY_RECOVERY_CHAT_ENABLED=false`。
+- 详细背景见 `docs/bugs.md` 的三条 2026-10-26 记录（配置被写成停用 / 漏单机制缺口 / 本轮修复）。

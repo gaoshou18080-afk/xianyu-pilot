@@ -199,3 +199,68 @@
 2. 预热重连：连接活到 ~30 秒即新建连接替换，实现零窗口（需验证平台是否允许短暂双连）。
 3. 兜底对账（不依赖 WS）：修 acc2 订单接口权限 + 周期订单同步，才是可靠保险。
 4. 裸 ACK 识别 + xbroadcast 回放包跳过，降低 15 万条/天日志与 CPU。
+
+## 2026-10-26（修复）：自动发货补上"订单号 + 聊天消息兜底补发 + 可读失败原因"
+
+针对上面两条 2026-10-26 记录的根因，本轮做了 5 处代码修复（提交见 `git log`）。
+
+**1. 订单号解析（致命缺口）**
+
+- 付款卡片的 `reminderUrl` 只有 `itemId/peerUserId/sid/messageId`，**没有 orderId**；
+  订单号在 `rawPayload["1"]["6"]["3"]["5"]`（转义 JSON 的 dxCard，按钮 `idleDeliver?...&orderId=`）
+  和 `rawPayload["1"]["10"]["extJson"]` 的 `updateKey`（`<sid>:<orderId>:...`）里。
+- 新增 `app/services/payment_order_id.py`：`extract_order_id_from_text/payload/message`，
+  支持 `orderId=`、`bizOrderId=`、`order_detail?id=`、`updateKey` 冒号段、`"orderId":`，
+  递归 6 层、兼容"JSON 字符串套 JSON 字符串"。实测历史消息 `id=1100` 解析出
+  `5127384999311028844`。
+- `ws_protocol.parse_numbered_fields` 返回体新增 `orderId`，`ws_delivery_handler._process_delivery`
+  按 `msg.orderId → extract_order_id_from_message → reminderUrl` 顺序取值。
+  效果：`realtime_delivery_attempt.external_order_id` / `delivery_record.order_id` 不再恒为 NULL，
+  幂等从"消息事件键"升级为"订单键"（同买家复购不会被误判重复）。
+
+**2. 去重防线原本是死代码**
+
+- 旧 `_has_existing_realtime_delivery` 查 `delivery_record.receiver_info` 的
+  `sid/xyGoodsId/buyerUserId`，但实时发货写入的 `receiver_info` 只有
+  `{"realtimeAttemptId": N}` → 永远命中 0 行，等于没有防线。
+- 改为 `_find_duplicate_delivery`：有订单号按 `realtime_delivery_attempt.external_order_id`
+  查（`superseded` 忽略；`failed & retry_safe=1` 交给状态机重试；其余状态拦截）；
+  无订单号退化为"会话+商品+买家"10 分钟窗口（`@goofish` 后缀双向归一）。
+
+**3. 无规则命中时给出可读原因**
+
+- `_diagnose_missing_rule()` 输出 `goods_not_found / config_missing / config_disabled /
+  mode_unsupported / card_group_missing / unknown`，日志变成
+  `Realtime delivery no rule matched ... reason=config_disabled`。
+  以后"页面显示启用但不发货"能一句话定位。
+
+**4. 聊天消息兜底补发通道（新）**
+
+- 账号 2 的「已售出订单」接口返回 `PERMISSION_EXCEPTION::无权限访问`，`xianyu_trade_order`
+  一条都没有，原 `delivery_recovery`（按订单表扫）对它永远无效。
+- 新增第二通道：直接扫 `xianyu_chat_message`（`content_type=26 & direction='IN' &
+  reminder_content LIKE '%已付款%'`，默认回看 12 小时、每次 20 条、至少 300 秒前），
+  找出没有 success/pending 类 attempt 的付款消息，用 `_process_delivery` 重跑一遍状态机。
+- 只重试"发送前失败"的旧尝试（`delivery_mode_unavailable` / `card_group_missing` /
+  `delivery_content_empty` 或 `retry_safe=1`），先把旧 attempt 置为
+  `state='superseded'`（`event_key` 加 `sup:` 前缀避免唯一键冲突）；已发送/未知态一律不动。
+- 开关/参数（`.env`，可选）：`DELIVERY_RECOVERY_CHAT_ENABLED`（默认 true）、
+  `DELIVERY_RECOVERY_CHAT_LOOKBACK_HOURS`（默认 12，1~168）、
+  `DELIVERY_RECOVERY_CHAT_BATCH_SIZE`（默认 20，1~100）。
+- ⚠️ 风险：系统无法感知"用户在闲鱼 App 里手工发过卡"的单子，回看窗口内的老单会被补发一次。
+  如已人工补发过，把窗口调小或临时 `DELIVERY_RECOVERY_CHAT_ENABLED=false`。
+
+**5. INFO 日志进不了 journald**
+
+- `uvicorn` 启动时没有 `basicConfig`，root logger 默认 WARNING，`WS 连接成功` /
+  `Realtime delivery ...` / `delivery_recovery ...` 全部看不到，排障全靠猜。
+- `app/main.py` 增加 `_configure_logging_once()`：无 handler 时 `basicConfig`，
+  `LOG_LEVEL` 默认 `INFO`，并统一 `root.setLevel`。
+
+**运维提醒**
+
+- 代码不能替用户打开配置：`delivery_goods_config` 里 goods 17（`1094823097374`）、
+  goods 25（`1091821311650`）的 `payDelivery.enabled=0`（10-26 11:37:55/11:37:59 被保存动作写成停用，
+  与 09:21 那次同因），另外 `1092539311888` / `1092046159577` / `1092280824859` / `1094895404770`
+  根本没有配置行。必须在「自动发货」页面重新选「启用」并保存。
+- 前端「启用/停用」是 `<select>`，鼠标滚轮/键盘很容易静默改值；后续建议换 checkbox + 保存前提示。
