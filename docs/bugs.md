@@ -244,11 +244,16 @@
 - 只重试"发送前失败"的旧尝试（`delivery_mode_unavailable` / `card_group_missing` /
   `delivery_content_empty` 或 `retry_safe=1`），先把旧 attempt 置为
   `state='superseded'`（`event_key` 加 `sup:` 前缀避免唯一键冲突）；已发送/未知态一律不动。
+- **人工已回复安全阀（关键）**：付款后 6 小时内同一会话只要出现卖家 `OUT` 消息，就判定这单
+  已人工手工发货，跳过不补。依据：2026-10-26 当天 3 个"失败"订单（18:41 `68536498773`、
+  18:52 `68233063241`、09:23 `68212471464`）的买家其实都已收到人工发的 `sk-...` key，
+  无脑补发会重复发卡。被挡掉的条数记在 `chatSkippedHumanReply` 统计里。
 - 开关/参数（`.env`，可选）：`DELIVERY_RECOVERY_CHAT_ENABLED`（默认 true）、
   `DELIVERY_RECOVERY_CHAT_LOOKBACK_HOURS`（默认 12，1~168）、
-  `DELIVERY_RECOVERY_CHAT_BATCH_SIZE`（默认 20，1~100）。
-- ⚠️ 风险：系统无法感知"用户在闲鱼 App 里手工发过卡"的单子，回看窗口内的老单会被补发一次。
-  如已人工补发过，把窗口调小或临时 `DELIVERY_RECOVERY_CHAT_ENABLED=false`。
+  `DELIVERY_RECOVERY_CHAT_BATCH_SIZE`（默认 20，1~100）、
+  `DELIVERY_RECOVERY_CHAT_SKIP_HUMAN_REPLY`（默认 true，设 false 表示无视人工回复强行补发）。
+- 残余风险：如果人工是在**别的设备/系统外**发的货且没在闲鱼里回消息，仍可能补发一次；
+  反之如果自动回复机器人对付款消息回过一句话，该单会被安全阀挡住（宁可漏补，不重复发卡）。
 
 **5. INFO 日志进不了 journald**
 

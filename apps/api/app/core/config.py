@@ -88,6 +88,9 @@ class Settings(BaseSettings):
     # 首次上线只回看 12 小时，避免把「已经人工手动发过卡」的老单再补一遍。
     delivery_recovery_chat_lookback_hours: int = 12
     delivery_recovery_chat_batch_size: int = 20
+    # 付款后 6 小时内，同一会话只要有卖家 OUT 消息，就认为人工已经手工发货，
+    # 跳过补发，避免给已经收到 key 的买家重复发卡。
+    delivery_recovery_chat_skip_human_reply: bool = True
 
     # 内部调用令牌。Phase 1 起内部接口 fail-closed：为空时拒绝内部调用。
     internal_api_token: str = Field(

@@ -392,6 +392,7 @@ async def _find_pending_payment_messages(
     lookback_hours: int,
     min_age_seconds: int,
     limit: int,
+    skip_human_reply: bool = True,
 ) -> list[dict[str, Any]]:
     """扫描 WS 落库的"已付款"卡片消息，找出还没发货的单子。
 
@@ -404,12 +405,33 @@ async def _find_pending_payment_messages(
 
     因此这里直接以聊天消息为准做兜底补发：配置停用期间漏掉的单、
     卡密库存不足、WS / 进程重启期间的失败，都能在配置修好后自动补上。
+
+    ``skip_human_reply``（默认开）：付款后 6 小时内同一会话只要出现**卖家 OUT 消息**，
+    就认为这单是人工手动发的，跳过不补，避免给已经手打过卡密的买家重复发卡
+    （2026-10-26 实测：当天 3 个"失败"订单的买家其实都已手动收到 key）。
     """
+
+    human_reply_guard = (
+        """
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM xianyu_chat_message o
+                  WHERE o.account_id = m.account_id
+                    AND o.s_id = m.s_id
+                    AND o.direction = 'OUT'
+                    AND o.deleted = 0
+                    AND o.created_time >= m.created_time
+                    AND o.created_time <= DATE_ADD(m.created_time, INTERVAL 6 HOUR)
+                )
+        """
+        if skip_human_reply
+        else ""
+    )
 
     rows = (
         await db.execute(
             text(
-                """
+                f"""
                 SELECT m.id AS message_id,
                        m.account_id,
                        m.s_id,
@@ -447,6 +469,7 @@ async def _find_pending_payment_messages(
                         a.source_event_id IN (m.pnm_id, m.message_uid)
                       )
                   )
+                {human_reply_guard}
                 ORDER BY m.id DESC
                 LIMIT :limit
                 """
@@ -459,6 +482,65 @@ async def _find_pending_payment_messages(
         )
     ).mappings().all()
     return [dict(row) for row in rows]
+
+
+async def _count_human_replied_payment_messages(
+    db: AsyncSession,
+    *,
+    lookback_hours: int,
+    min_age_seconds: int,
+) -> int:
+    """统计被"人工已回复"安全阀挡掉的付款消息条数（纯观测用）。"""
+
+    try:
+        value = (
+            await db.execute(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM xianyu_chat_message m
+                    INNER JOIN xianyu_account acc
+                      ON acc.id = m.account_id
+                     AND acc.status = 1
+                     AND acc.deleted = 0
+                    WHERE m.deleted = 0
+                      AND m.direction = 'IN'
+                      AND m.content_type = 26
+                      AND m.reminder_content LIKE '%已付款%'
+                      AND m.created_time >= DATE_SUB(NOW(), INTERVAL :lookback_hours HOUR)
+                      AND m.created_time <= DATE_SUB(NOW(), INTERVAL :min_age_seconds SECOND)
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM realtime_delivery_attempt a
+                        WHERE a.account_id = m.account_id
+                          AND a.state IN (
+                            'success', 'unknown', 'message_sent',
+                            'message_sending', 'platform_confirming', 'pending'
+                          )
+                          AND a.source_event_id IN (m.pnm_id, m.message_uid)
+                      )
+                      AND EXISTS (
+                        SELECT 1
+                        FROM xianyu_chat_message o
+                        WHERE o.account_id = m.account_id
+                          AND o.s_id = m.s_id
+                          AND o.direction = 'OUT'
+                          AND o.deleted = 0
+                          AND o.created_time >= m.created_time
+                          AND o.created_time <= DATE_ADD(m.created_time, INTERVAL 6 HOUR)
+                      )
+                    """
+                ),
+                {
+                    "lookback_hours": int(lookback_hours),
+                    "min_age_seconds": int(min_age_seconds),
+                },
+            )
+        ).scalar()
+        return int(value or 0)
+    except Exception:  # noqa: BLE001 - 纯观测，失败不影响主流程
+        logger.debug("统计人工已回复付款消息失败", exc_info=True)
+        return 0
 
 
 def _message_from_chat_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -661,17 +743,32 @@ async def _run_chat_message_recovery(
     lookback_hours: int,
     min_age_seconds: int,
     limit: int,
+    skip_human_reply: bool = True,
 ) -> dict[str, Any]:
     """按付款卡片消息补发一轮，返回统计。"""
 
-    stats = {"scanned": 0, "recovered": 0, "skipped": 0, "failed": 0, "details": []}
+    stats = {
+        "scanned": 0,
+        "recovered": 0,
+        "skipped": 0,
+        "failed": 0,
+        "skippedHumanReply": 0,
+        "details": [],
+    }
     async with async_session() as db:
         rows = await _find_pending_payment_messages(
             db,
             lookback_hours=lookback_hours,
             min_age_seconds=min_age_seconds,
             limit=limit,
+            skip_human_reply=skip_human_reply,
         )
+        if skip_human_reply:
+            stats["skippedHumanReply"] = await _count_human_replied_payment_messages(
+                db,
+                lookback_hours=lookback_hours,
+                min_age_seconds=min_age_seconds,
+            )
     stats["scanned"] = len(rows)
     for row in rows:
         try:
@@ -839,6 +936,7 @@ async def run_delivery_recovery_once(
                 lookback_hours=int(settings.delivery_recovery_chat_lookback_hours),
                 min_age_seconds=min_age,
                 limit=int(settings.delivery_recovery_chat_batch_size),
+                skip_human_reply=bool(settings.delivery_recovery_chat_skip_human_reply),
             )
         except Exception as exc:  # noqa: BLE001
             logger.error(
@@ -851,6 +949,9 @@ async def run_delivery_recovery_once(
         stats["chatRecovered"] = chat_stats.get("recovered", 0)
         stats["chatSkipped"] = chat_stats.get("skipped", 0)
         stats["chatFailed"] = chat_stats.get("failed", 0)
+        stats["chatSkippedHumanReply"] = chat_stats.get("skippedHumanReply", 0)
+        if chat_stats.get("scanned") or chat_stats.get("recovered") or chat_stats.get("failed"):
+            logger.info("delivery_recovery chat batch summary: %s", {k: v for k, v in chat_stats.items() if k != "details"})
         if chat_stats.get("recovered") or chat_stats.get("failed"):
             stats["chatDetails"] = chat_stats.get("details", [])
             logger.info("delivery_recovery chat batch: %s", chat_stats)

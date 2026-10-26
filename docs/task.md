@@ -156,7 +156,8 @@ tail -f output/local-dev/api.out.log
   3. 去重防线重写为 `_find_duplicate_delivery`（原实现查 `receiver_info` 是死代码）；
   4. `_diagnose_missing_rule`：无规则命中时日志给 `reason=config_disabled` 等可读原因；
   5. `delivery_recovery` 新增「按付款卡片消息补发」通道（acc2 无订单接口权限的兜底），
-     worker 每 600s 跑一轮，默认回看 12 小时、每轮 20 条；
+     worker 每 600s 跑一轮，默认回看 12 小时、每轮 20 条；并加"付款后 6h 内有卖家 OUT 消息
+     就跳过"的人工已回复安全阀（防止给已手打发卡的买家重复发卡）；
   6. `main.py` 配 `basicConfig`，INFO 日志进 journald。
 - 发布步骤：本地测试 31 passed → commit → push `fork main` → 服务器
   `git pull --ff-only fork main` + `systemctl restart xianyu-api xianyu-worker`。
@@ -167,6 +168,7 @@ tail -f output/local-dev/api.out.log
   - `journalctl -u xianyu-api -u xianyu-worker --since "10 min ago" | grep -E "reason=|delivery_recovery|订单号"`
   - `select id,external_order_id,state,last_error_code from realtime_delivery_attempt where created_time>=CURDATE() order by id desc limit 20;`
     预期 `external_order_id` 非空。
-- 风险：回看窗口内的老单会被补发一次（系统看不到"人工在闲鱼 App 手工发货"的动作），
-  必要时调 `DELIVERY_RECOVERY_CHAT_LOOKBACK_HOURS` 或 `DELIVERY_RECOVERY_CHAT_ENABLED=false`。
+- 风险：安全阀只能靠"会话里有没有卖家 OUT 消息"判断人工是否已发货，仍有概率漏判/误判；
+  必要时调 `DELIVERY_RECOVERY_CHAT_LOOKBACK_HOURS`、`DELIVERY_RECOVERY_CHAT_SKIP_HUMAN_REPLY`
+  或直接 `DELIVERY_RECOVERY_CHAT_ENABLED=false`。
 - 详细背景见 `docs/bugs.md` 的三条 2026-10-26 记录（配置被写成停用 / 漏单机制缺口 / 本轮修复）。
