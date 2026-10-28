@@ -352,6 +352,7 @@ class XianyuWebSocketClient:
         self._sync_outstanding = 0  # 已发出但还没收到同步回包的请求数
         self._sync_sent_total = 0  # 累计发出的同步请求数（用于降噪日志）
         self._fail_streak = 0  # 连续连接失败次数（用于指数退避）
+        self._registered_at = 0.0  # 本次连接注册成功的时刻（判断"正常会话结束"）
 
         # 外部回调（如消息存储）
         self.on_message_callback = on_message_callback
@@ -743,7 +744,10 @@ class XianyuWebSocketClient:
         平台会话上限约 35 秒，每次会话结束都要尽快重连以减少消息丢失窗口；
         而登录/注册/Token 失败属于异常，慢重试避免触发风控。
         """
-        if self.phase in ("closed", "connected"):
+        lasted = (time.time() - self._registered_at) if self._registered_at else 0.0
+        if self.phase in ("closed", "connected") or lasted >= 5:
+            # 注册成功且活过 5 秒 ⇒ 这是"平台会话到期/被硬断"，属于正常周期，
+            # 必须立刻重连（否则 5/10/20 秒退避会白丢一大堆入站消息）。
             self._fail_streak = 0
             return float(RECONNECT_DELAY)
         streak = int(getattr(self, "_fail_streak", 0)) + 1
@@ -949,6 +953,7 @@ class XianyuWebSocketClient:
                 return
             # 对标商业版 im_client.py:156：注册成功后标记 _registered
             self._registered = True
+            self._registered_at = time.time()
 
             # Step 4: 同步改为后台任务，不阻塞连接成功
             # 商业版 im_client.py:155-163：注册后立即 return True，同步/心跳在后台进行
