@@ -369,6 +369,19 @@ async def _recover_one_order(
     if not source_event_id:
         source_event_id = f"recovery:order:{external_order_id}"
 
+    # 合成的 session_id 不是平台真实会话 ID，发送必然失败（历史上会占掉一张卡密、
+    # 再把 attempt 写成 unknown）。这里直接跳过，等 WS 实时消息落库建立会话后再补发。
+    # 只有"买家从未与我们产生任何聊天记录"的订单才会走到这里。
+    if str(session_id).startswith("recovery:"):
+        logger.warning(
+            "delivery_recovery skip order=%s reason=session_missing accountId=%d buyer=%s itemId=%s",
+            order.get("order_id"),
+            account_id,
+            buyer_id,
+            item_id,
+        )
+        return None
+
     event_key = build_realtime_delivery_event_key(
         account_id=account_id,
         external_order_id=external_order_id,
