@@ -379,3 +379,40 @@ UPDATE realtime_delivery_attempt
 新增/受影响 .env 项：`DELIVERY_RECOVERY_INTERVAL_SECONDS=60`、`DELIVERY_RECOVERY_MIN_AGE_SECONDS=60`；
 代码新增配置 `DELIVERY_RECOVERY_ORDER_SYNC_ENABLED`（默认 true）、
 `AI_REPLY_MAX_MESSAGE_AGE_SECONDS`（默认 900，均为可选覆盖）。
+
+## 版本 `7cfc20a` <=> WS 秒级同步 + 补发兜底 15 秒（2026-10-29）
+
+代码本身只需 `git pull` + 重启；本次另有 **`.env` 配置调整**，必须按下面执行，
+否则 `DELIVERY_RECOVERY_INTERVAL_SECONDS` 会被旧校验拒绝启动。
+
+### 1. 服务器 C 发布命令
+
+```bash
+ssh -i /var/www/sshkey/xinjiapo guanli@104.234.174.250
+cd /var/www/xianyu
+source ~/.bashrc && proxy_on
+git pull --ff-only fork main            # 目标版本 7cfc20a
+cp .env /tmp/env.bak.$(date +%s)        # 备份
+sed -i 's/^DELIVERY_RECOVERY_INTERVAL_SECONDS=.*/DELIVERY_RECOVERY_INTERVAL_SECONDS=15/; \
+        s/^DELIVERY_RECOVERY_MIN_AGE_SECONDS=.*/DELIVERY_RECOVERY_MIN_AGE_SECONDS=10/' .env
+grep -E "DELIVERY_RECOVERY_(INTERVAL|MIN_AGE)" .env
+echo "xu0527Yang" | sudo -S systemctl restart xianyu-api xianyu-worker
+systemctl is-active xianyu-api xianyu-worker
+```
+
+### 2. 配置变更说明
+
+| 变量 | 旧值 | 新值 | 原因 |
+|---|---|---|---|
+| `DELIVERY_RECOVERY_INTERVAL_SECONDS` | 60 | **15** | WS 付款卡片到达仍有秒级抖动，这层是"不依赖 WS"的硬兜底，最坏 15~20 秒送达 |
+| `DELIVERY_RECOVERY_MIN_AGE_SECONDS` | 60 | **10** | 与实时通道抢跑的窗口压到 10 秒；同订单有 `accountId+orderId` 串行锁 + 订单维度去重，不会重复发 |
+
+新增可选变量（代码内有默认值，不配也行）：`WS_SYNC_POLL_INTERVAL_SECONDS=2`、
+`WS_RECONNECT_DELAY_SECONDS=0.2`。
+
+### 3. 验证
+
+```bash
+journalctl -u xianyu-worker --since "2 min ago" -o cat | grep "delivery_recovery loop started"   # interval=15s minAge=10s
+journalctl -u xianyu-api    --since "1 min ago" -o cat | grep "同步请求已发送" | tail -10          # 每 2 秒一条
+```
