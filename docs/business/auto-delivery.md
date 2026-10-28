@@ -48,3 +48,49 @@
 2. **聊天通道安全阀会误挡**：它只判 `direction='OUT'`，把 AI 回复、以及系统自己发出的发货消息都算作"人工已回复"。付款后 6h 内只要会话里出现过任何 OUT 消息，该单就永久跳过补发。
 3. **无订单号的付款事件**（线上 attempt 25/30 的 `external_order_id` 仍为 NULL）只能靠 10 分钟会话窗口去重，重复风险更高。
 4. **`auto_reply_paused` 在生产从未落库**：库内 227 个会话 `auto_reply_paused=1` 为 0 条、`last_manual_reply_at` 全为 NULL。即 `_pause_auto_reply_for_manual_outbound` 实际未生效（疑似 `msg['direction']` 未赋值，或 `s_id` 带 `@goofish` 后缀 UPDATE 不中），真正拦住 AI 的只是 policy 层直接查 `xianyu_chat_message` 的兜底判断（14 天内 1 条 `human_intervention_active`）。待修。
+
+## 6. 端到端到达延迟（2026-10-29 实测与优化）
+
+链路拆解：`平台 → WS 收到 syncPushPackage → 落库 xianyu_chat_message → 规则匹配 → 发卡`。
+其中「落库→发卡」实测 0~1 秒，**唯一瓶颈是 `平台→WS 落库`**。
+
+### 6.1 修复前的时间线（订单 5127833412058086516）
+
+| 时间(+07) | 事件 |
+|---|---|
+| 00:31:46.8 | 平台付款 |
+| 00:32:05.4 | WS 才收到这批发货相关消息（**延迟 18.6s**，与"记得及时发货"这条文本消息同批） |
+| 00:32:06.5 | 规则命中 ruleId=22 |
+| 00:32:07.8 | 卡密发出（attempt 48 success） |
+
+**根因**：`_handle_sync_package` 里"收到回包才发下一轮 ackDiff"的**被动链式同步**。
+平台对 `/r/SyncStatus/ackDiff` 是**长轮询**（无数据时把请求挂住 15~30 秒），
+且响应包多数不带 `lwp=/r/SyncStatus/ackDiff`，`is_ack_diff` 判定为假 ⇒ 一条连接
+（32 秒会话）里只发出 **1 次**同步请求，付款卡片要等下一次同步/下一条文本消息
+（攒批）才下发，抖动 0~30 秒。
+
+叠加放大：`_ThreadedWebSocketAdapter.close()` 用 5+5 秒等待，每 32 秒会话回收
+实际白丢 ~8 秒入站消息（离线率 ~25%）。
+
+### 6.2 已上线的修复（提交 `c5db4c5` / `a847411`）
+
+| 位置 | 改动 |
+|---|---|
+| `ws_client.py::_sync_loop` | **新增独立定时器，每 2 秒主动发 ackDiff**，不再依赖回包触发；`_sync_outstanding` 计数，连续 5 个无回包才让位，避免堆积 |
+| `ws_client.py::close()` | 关闭等待 5+5s → 1+1s，会话回收空窗 ~9s → ~1.5s |
+| `ws_client.py` | `RECONNECT_DELAY` 1 → 0.2s（`WS_RECONNECT_DELAY_SECONDS` 可调） |
+| `ws_delivery_handler.py` | 新增 `_process_delivery` 外层按 `accountId+orderId` **asyncio 串行锁**（120s 超时），同订单两条付款消息不再各建 attempt（线上 47 unconfigured + 48 success 的重复） |
+| `ws_delivery_handler.py::_find_duplicate_delivery` | `delivery_mode_unavailable` 且 attempt 在 180 秒内 → 视为可重试（商品/规则晚于付款消息落库的竞态，付款 1 秒后才同步到商品时不能永久卡死） |
+
+可调环境变量：`WS_SYNC_POLL_INTERVAL_SECONDS`（默认 2）、`WS_RECONNECT_DELAY_SECONDS`（默认 0.2）。
+
+### 6.3 观测口径
+
+```sql
+-- 付款卡片落库延迟（目标 p90 < 2s）
+SELECT id, s_id, FROM_UNIXTIME(NULLIF(message_time,0)/1000) mt, created_time,
+       TIMESTAMPDIFF(SECOND, FROM_UNIXTIME(NULLIF(message_time,0)/1000), created_time) lag_s
+FROM xianyu_chat_message WHERE content_type=26 AND created_time>=DATE_SUB(NOW(),INTERVAL 1 HOUR);
+-- 同步节拍（应每 2 秒一条）
+journalctl -u xianyu-api --since "2 min ago" -o cat | grep "同步请求已发送" | tail -20
+```

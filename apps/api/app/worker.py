@@ -103,7 +103,11 @@ async def run_delivery_recovery_forever(
 
     One order failure never terminates the loop. The interval defaults to
     ``settings.delivery_recovery_interval_seconds`` (10 minutes) and is bound
-    to [60, 86400] seconds. Disabled via ``settings.delivery_recovery_enabled``.
+    to [10, 86400] seconds. Disabled via ``settings.delivery_recovery_enabled``.
+
+    2026-10-29：下限 60s → 10s。WS 侧付款卡片到达仍有秒级抖动，这一层是
+    "不依赖 WS"的硬兜底：每轮先同步一次订单，再补发，线上配 15s 即最坏 15~20s 送达。
+    
     """
 
     if not settings.delivery_recovery_enabled:
@@ -115,7 +119,7 @@ async def run_delivery_recovery_forever(
         if interval_seconds is not None
         else settings.delivery_recovery_interval_seconds
     )
-    interval = max(60, min(interval, 86_400))
+    interval = max(10, min(interval, 86_400))
     stop = stop_event or asyncio.Event()
     logger.info(
         "delivery_recovery loop started interval=%ss batch=%s minAge=%ss",

@@ -198,3 +198,16 @@ tail -f output/local-dev/api.out.log
   `xianyu_conversation` 无 `deleted` 列导致订单兜底必然异常。
 - 已修复：游标推进、时间字段与时间区转换、会话查询 SQL、补发循环内嵌 HTTP 订单同步、AI 陈旧消息守卫。
 - 详见 `docs/bugs.md` 2026-10-29 条目。
+
+## 自动发货延迟压测（2026-10-29，已发布 c5db4c5 / a847411）
+
+- 用户诉求：闲鱼端付款后要"秒级"自动发货（≤30 秒），线上实测付款→发货 20 秒。
+- 根因：`/r/SyncStatus/ackDiff` 是长轮询且回包不带 lwp，被动链式同步导致一条 32 秒
+  会话只发 1 次同步 ⇒ 付款卡片 0~30 秒抖动；另有 close() 5+5 秒等待，会话回收白丢 8 秒。
+- 修复：`_sync_loop` 独立 2 秒主动轮询 + close 1+1 秒 + `RECONNECT_DELAY` 0.2s +
+  同订单 asyncio 串行锁（收敛重复 attempt）+ 180 秒内 `delivery_mode_unavailable` 允许重试。
+- 待验证：需真实付款/买家发消息各一次，比对 `xianyu_chat_message` 的
+  `created_time - message_time` 是否 p90 < 2 秒。详见 `docs/business/auto-delivery.md` §6。
+- 附带发现：商品 `1096808224767`（最新版量卡不限时3亿额度，goods 29）**没有
+  `delivery_goods_config` 配置行**，订单 5127565466048278100（05:52 付款）因此
+  `delivery_mode_unavailable` 未发货 —— 属配置缺失，不是代码问题。

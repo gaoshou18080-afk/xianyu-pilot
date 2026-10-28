@@ -330,9 +330,9 @@ class Settings(BaseSettings):
             )
         if not 1 <= self.scheduler_batch_size <= 100:
             raise ValueError("SCHEDULER_BATCH_SIZE must be between 1 and 100")
-        if not 60 <= self.delivery_recovery_interval_seconds <= 86_400:
+        if not 10 <= self.delivery_recovery_interval_seconds <= 86_400:
             raise ValueError(
-                "DELIVERY_RECOVERY_INTERVAL_SECONDS must be between 60 and 86400"
+                "DELIVERY_RECOVERY_INTERVAL_SECONDS must be between 10 and 86400"
             )
         if not 1 <= self.delivery_recovery_batch_size <= 200:
             raise ValueError("DELIVERY_RECOVERY_BATCH_SIZE must be between 1 and 200")

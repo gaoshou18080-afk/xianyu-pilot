@@ -1,5 +1,40 @@
 # 问题与踩坑记录（docs/bugs.md）
 
+## 2026-10-29：付款卡片到达延迟 0~30 秒（自动发货"不快"），WS 一条会话只同步一次
+
+**现象**
+
+- 用户端：闲鱼付款后自动发货要等 20 秒以上，别人家"秒级"。
+- 实测（订单 `5127833412058086516`）：付款 `00:31:46.8` → WS 落库 `00:32:05.4`（18.6s）
+  → 规则命中 `00:32:06.5` → 卡密发出 `00:32:07.8`。**落库→发卡只有 1 秒**。
+
+**根因**
+
+1. `/r/SyncStatus/ackDiff` 是**长轮询**：无数据时请求被服务端挂住 15~30 秒；
+   而回包大多不带 `lwp=/r/SyncStatus/ackDiff`，`_handle_sync_package` 里
+   `if is_ack_diff: await self._do_sync()` 的链式重同步**几乎不触发** ⇒ 每条
+   32 秒会话只发出 1 次同步请求，付款卡片只能等下一批（下一条文本消息）捎带下发。
+2. `_ThreadedWebSocketAdapter.close()` 等待 5s(close_event) + 5s(thread.join)，
+   每 32 秒会话回收实际丢 ~8 秒入站消息（离线率 ~25%）。
+3. 一单付款会连着收到 2 条付款相关消息，并发进入 `_process_delivery`，
+   两次去重查询都在对方写库前完成 ⇒ 同订单 2 个 attempt（`47 failed unconfigured`
+   + `48 success`）。
+
+**修复**
+
+- `ws_client._sync_loop`：独立定时器每 2 秒主动 ackDiff（`WS_SYNC_POLL_INTERVAL_SECONDS`，
+  默认 2），`_sync_outstanding` 连续 5 个无回包才让位；
+- `close()` 等待 5+5 → 1+1 秒；`RECONNECT_DELAY` 1 → 0.2 秒；
+- `ws_delivery_handler`：`_process_delivery` 外层加 `accountId+orderId` asyncio 串行锁；
+- 去重：`delivery_mode_unavailable` 且 attempt 在 180 秒内 → 允许重试（商品晚于
+  付款消息落库的竞态）。
+
+**教训**
+
+- 看到"消息到达慢"先量 `xianyu_chat_message.created_time - message_time`，
+  不要怀疑发货逻辑（发货本身 0~1 秒）。
+- 平台会攒批下发系统卡片（contentType=26），系统卡片本身不唤醒长轮询。
+
 ## 2026-10-06：商品已开启自动回复且 AI 测试正常，但买家消息没有 AI 回复
 
 **现象**
