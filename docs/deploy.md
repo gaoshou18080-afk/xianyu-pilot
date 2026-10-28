@@ -348,3 +348,34 @@ FROM delivery_goods_config WHERE goods_id IN (17, 25);
 `chatScanned=1 / chatSkipped=1 / chatSkippedHumanReply=6 / chatRecovered=0`
 —— 6 条因"付款后 6h 内已有卖家 OUT 消息（人工已手工发 key）"被安全阀挡下，
 1 条（`xianyu_chat_message.id=766`，goods `1094895404770` 买家 `68242230133`）因无配置跳过。
+
+## d8220ae（2026-10-29 00:18 +07）自动发货 WS 游标 / 订单兜底修复
+
+代码发布：服务器 `git pull --ff-only fork main` + `systemctl restart xianyu-api xianyu-worker`。
+
+非代码项（必须执行，否则兜底仍要等 10 分钟）：
+
+```bash
+cd /var/www/xianyu
+cp .env /tmp/.env.bak.$(date +%s)
+sed -i 's/^DELIVERY_RECOVERY_INTERVAL_SECONDS=600$/DELIVERY_RECOVERY_INTERVAL_SECONDS=60/; \
+        s/^DELIVERY_RECOVERY_MIN_AGE_SECONDS=300$/DELIVERY_RECOVERY_MIN_AGE_SECONDS=60/' .env
+systemctl restart xianyu-api xianyu-worker
+```
+
+数据修复（本次一次性，可复现）：
+
+```sql
+-- 1) acc3 订单从没同步过：手工触发一次全量同步（页面「同步已售订单」等效）
+--    POST /api/order/syncSoldOrders {"xianyu_account_id":3}  → inserted 12
+-- 2) 两条 use synthetic session_id 的 unknown attempt 重置为可重试（卡密已被
+--    heal 回池，未真正发出），等真实会话建立后由补发通道重发
+UPDATE realtime_delivery_attempt
+   SET state='failed', retry_safe=1, last_error_code='synthetic_session_id',
+       error_message='会话未建立，已重置等待真实会话', updated_time=NOW()
+ WHERE id IN (45,46);
+```
+
+新增/受影响 .env 项：`DELIVERY_RECOVERY_INTERVAL_SECONDS=60`、`DELIVERY_RECOVERY_MIN_AGE_SECONDS=60`；
+代码新增配置 `DELIVERY_RECOVERY_ORDER_SYNC_ENABLED`（默认 true）、
+`AI_REPLY_MAX_MESSAGE_AGE_SECONDS`（默认 900，均为可选覆盖）。
