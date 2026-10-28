@@ -1446,8 +1446,9 @@ class XianyuWebSocketClient:
                 await asyncio.sleep(interval)
                 if self._ws is not ws or not self._connected:
                     break
-                if self._sync_outstanding >= 3:
-                    # 平台侧长轮询还没回包，避免请求无限堆积
+                if self._sync_outstanding >= 5:
+                    # 平台侧连续 10 秒一个回包都没有（异常），先让位避免堆积；
+                    # 正常空闲时平台会立刻回空包，这里不会触发。
                     continue
                 try:
                     await self._do_sync(ws)
