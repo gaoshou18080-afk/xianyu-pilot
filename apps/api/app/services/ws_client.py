@@ -350,6 +350,7 @@ class XianyuWebSocketClient:
         self._sync_pts = 0  # 当前同步基点时间戳
         self._sync_high_pts = 0  # 当前同步高点水印
         self._sync_outstanding = 0  # 已发出但还没收到同步回包的请求数
+        self._sync_sent_total = 0  # 累计发出的同步请求数（用于降噪日志）
         self._fail_streak = 0  # 连续连接失败次数（用于指数退避）
 
         # 外部回调（如消息存储）
@@ -1427,10 +1428,19 @@ class XianyuWebSocketClient:
         msg = build_sync_message(self._sync_pts, self._sync_high_pts)
         self._sync_outstanding += 1
         await ws.send(json.dumps(msg, ensure_ascii=False))
-        logger.info(
+        self._sync_sent_total += 1
+        # 2 秒一次会刷出 4~5 万条/天/账号日志，这里降级为 debug，
+        # 每 60 次（约 2 分钟）打一条 info 供运维确认轮询还在跑。
+        logger.debug(
             "WS 同步请求已发送 accountId=%d pts=%s highPts=%s",
             self.account_id, self._sync_pts, self._sync_high_pts
         )
+        if self._sync_sent_total % 60 == 1:
+            logger.info(
+                "WS 同步轮询保持 accountId=%d sent=%d pts=%s outstanding=%d",
+                self.account_id, self._sync_sent_total, self._sync_pts,
+                self._sync_outstanding,
+            )
 
     async def _sync_loop(self, ws: _ThreadedWebSocketAdapter):
         """主动 ackDiff 轮询循环（默认 2 秒）。
@@ -1733,7 +1743,8 @@ class XianyuWebSocketClient:
         ack_ids = result.get("ack_pnm_ids", [])
 
         if not messages:
-            logger.info("WS 同步包未解析出可入库消息 accountId=%d", self.account_id)
+            # 主动轮询会带来大量空回包（每次心跳一个），降级为 debug
+            logger.debug("WS 同步包未解析出可入库消息 accountId=%d", self.account_id)
             # ackDiff 响应即使没有消息也要继续下一轮同步（长轮询）
             if is_ack_diff:
                 await self._do_sync(ws)
