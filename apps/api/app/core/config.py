@@ -85,6 +85,12 @@ class Settings(BaseSettings):
     # 聊天消息兜底补发：不依赖「已售出订单」接口（部分账号该接口无权限），
     # 直接扫描 WS 落库的付款卡片消息，把没发出去的单子补上。
     delivery_recovery_chat_enabled: bool = True
+    # WS 断线补偿会回放历史消息：超过该秒数的旧消息不再触发 AI 自动回复
+    # （避免半夜给买家补发一堆陈旧回复），但发货分支不受限制。
+    ai_reply_max_message_age_seconds: int = 900
+    # 补发循环内是否顺便用 HTTP 订单接口同步一次已售订单：
+    # WS 掉线/丢消息时，这是唯一可靠的订单数据源，保证兜底能在分钟级生效。
+    delivery_recovery_order_sync_enabled: bool = True
     # 首次上线只回看 12 小时，避免把「已经人工手动发过卡」的老单再补一遍。
     delivery_recovery_chat_lookback_hours: int = 12
     delivery_recovery_chat_batch_size: int = 20

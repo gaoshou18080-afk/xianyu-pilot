@@ -269,3 +269,82 @@
   与 09:21 那次同因），另外 `1092539311888` / `1092046159577` / `1092280824859` / `1094895404770`
   根本没有配置行。必须在「自动发货」页面重新选「启用」并保存。
 - 前端「启用/停用」是 `<select>`，鼠标滚轮/键盘很容易静默改值；后续建议换 checkbox + 保存前提示。
+
+## 2026-10-28：自动发货延迟 10~33 秒（"别人秒级"）—— 根因是 WS 同步游标冻结 + 重连离线窗口
+
+**实测基线（服务器 C，只读查询）**
+
+- 平台消息时间 → 我们落库时间（`xianyu_chat_message.created_time - FROM_UNIXTIME(message_time/1000)`，
+  近 3 天 contentType=26 的付款卡片）：
+  acc1 平均 8.4s / max 13s；acc2 平均 49.4s / max 1967s（1 条丢后补）；
+  acc3 平均 18.4s / max 33s（10 条里只有 1 条 ≤5s）。
+- 我们自己的链路（落库 → attempt → 发货消息）一直是 **0~1 秒**，慢的不是这段。
+
+**根因 1：ackDiff 同步游标不前进，每轮重放 77~102 条老消息**
+
+- `ws_client.py:1375` 只在 `_sync_pts<=0` 时赋一次值（进程启动时刻），此后永不更新；
+  `ws_client.py:1610-1635` 从 `body.syncPushPackage.maxPts/maxHighPts` 取水位，而该字段实际不存在
+  （日志里从无 `maxHighPts` 输出，`WS 同步请求已发送 ... pts=1793176969083256 highPts=0` 恒定）。
+- 结果：每 35 秒的每轮同步都从"进程启动时刻"起回放满 100 条上限，日志稳定 `WS 收到 102 条消息`、
+  `WS 收到 77/79 条消息`；而 DB 每小时只新增几十行（acc2 今日 15:00-17:00 共 101 行）→ 99% 是重复回放。
+- 新到的付款卡片只能等重放窗口滑到才出现（acc3 20:28:00.78 的付款卡片 20:28:10.1 才收到），
+  这就是 10~30s 延迟的直接来源。
+
+**根因 2：每 32 秒主动重连的离线窗口偏长**
+
+- `_ThreadedWebSocketAdapter.close()` 等 `close_event` 5s + `thread.join` 5s（`ws_client.py:248-268`）。
+- 实测 acc2（19:00 起 159 个周期）：主动重连 → 注册成功 的离线时长 p50 **2.0s**、p90 **9.0s**、
+  max **13s**、平均 **4.0s**，45% 的周期 >2s。加上 `RECONNECT_DELAY=1` 与注册 1.1s，
+  离线占比约 11%。
+
+**附带**
+
+- `_process_message` 在接收循环里串行 await（DB + outbox + SSE 广播），重复消息也全额走一遍查询，
+  会造成队头阻塞。
+- 今日 19:15~20:29 的 4 单失败（attempt 41-44）与延迟无关，是 acc3 商品 `1096811748835`
+  `config_missing` → `delivery_mode_unavailable`。
+
+**修复方向（未实施）**
+
+1. P0 修正游标：每轮用已收消息最大 `messageTime`+1µs（或 now）作为 `pts`，并从响应任意层正确解析
+   `maxPts/highPts` 推进；保留 pnmId 去重 + 现有对账兜底防漏。预期付款卡片延迟 → <1s。
+2. P1 消除 close 卡顿：先 `sock.shutdown`/`close_frame` 立即返回，不再等 5s+5s；`RECONNECT_DELAY` 1→0.2。
+   预期离线 4.0s → ~1.3s。
+3. P2 处理解耦：批量按 `pnm_id` 预查重，重复直接丢弃（不写库不发 SSE）；付款类消息优先触发发货。
+4. P3/P4（可选）：预热双连接（需探针验证同账号并发不被互踢）；3~5s HTTP 轮询兜底把最坏时延锁死。
+
+### 2026-10-29：acc3 测试拍单付款 9 分钟完全没反应——4 个独立缺陷叠加
+
+用户已给「高手在仙界」(acc3) 商品 `1096807048573` 配好自动发货（`delivery_goods_config.id=22`，
+`updated_time=2026-10-28 23:58:48`），01:01:01 拍单付款成功，系统无任何反应。
+
+排查结论（线上实测，只读）：
+
+1. **订单真实存在**：`fetch_sold_orders_page(3)` 直连成功，返回
+   `orderId=5127895009054122526 / itemId=1096807048573 / 待发货 / paySuccessTime=2026-10-29 01:01:01`。
+   → 不是"没付款"，也不是"配置没生效"。
+2. **WS 同步游标冻结**：`WS 同步请求已发送 pts=1793189669868316` 每 32 秒恒定不变，
+   每轮 `WS 收到 103 条消息` 全是重复回放；`xianyu_chat_message` 自 21:37 后无新行
+   （19点49条 / 20点38条 / 21点4条 / 22点0条 / 23点3条），付款卡片根本没进库。
+3. **acc3 没有订单同步数据源**：`xianyu_trade_order` acc3 长期 0 行；`scheduled_task` 里
+   只有 acc2 的每日 02:05 同步（且 COOKIE_EXPIRED）。acc3 只能靠"WS 收到消息"触发订单同步，
+   而 19:15/19:22/19:40/20:28 四次触发都返回 `PLATFORM_UNAVAILABLE`。
+   手工调 `POST /api/order/syncSoldOrders` 立即可用 → 一次补回 12 单。
+4. **订单字段解析错**：`xianyu_order_sync._parse_order_time` 读 `payTime/paymentTime`，
+   平台实际返回 `paySuccessTime` → `pay_time` 恒 NULL，而补发扫描 `WHERE pay_time IS NOT NULL` 直接跳过。
+5. **时区错位**：平台时间是北京时间(+08)，服务器/DB 是 +07，`pay_time` 落库后比 `NOW()` 快 1 小时，
+   `pay_time <= NOW()-300s` 恒不成立 → 订单兜底要等 1 小时后才可能生效。
+6. **补发通道 SQL 报错**：`delivery_recovery._resolve_session_id` 查 `xianyu_conversation WHERE deleted = 0`，
+   该表**没有 deleted 列** → 每个订单都 `OperationalError 1054` 失败（订单兜底从来没成功过）。
+
+修复（本次已提交）：
+
+- `ws_client.py`：新增 `_extract_sync_watermarks`（递归找 maxPts/highPts），
+  每批消息用 `max(messageTime)*1000+1000` 推进 `_sync_pts` → 游标不再冻结，重连空窗期的消息
+  下一轮同步能补回来。
+- `xianyu_order_sync.py`：`pay_time` 读 `paySuccessTime`；时间按 +08 解析后转服务器本地时区。
+- `delivery_recovery.py`：会话查询去掉不存在的 `deleted` 列，按规范化对端 ID 匹配、优先命中同商品会话；
+  新增 `sync_delivery_account_orders()`，补发循环前先用 HTTP 订单接口同步一次（WS 挂了也有数据源）。
+- `ws_startup.py`：AI 分支增加陈旧消息守卫 `ai_reply_max_message_age_seconds=900`，
+  防止游标推进后一次性回放历史消息导致半夜给买家补发一堆 AI 回复（发货分支不受限）。
+- `worker.py` + `config.py`：`delivery_recovery_order_sync_enabled`（默认 true）。

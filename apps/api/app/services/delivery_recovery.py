@@ -19,6 +19,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 from typing import Any
 
@@ -162,33 +164,51 @@ async def _resolve_session_id(
 
     buyer_id = str(buyer_id or "").strip()
     item_id = str(item_id or "").strip()
-    if buyer_id and item_id:
-        row = (
-            await db.execute(
-                text(
-                    """
-                    SELECT s_id
-                    FROM xianyu_conversation
-                    WHERE deleted = 0
-                      AND account_id = :account_id
-                      AND (
-                        peer_external_uid = :buyer_id
-                        OR external_buyer_id = :buyer_id
-                      )
-                      AND goods_id = :item_id
-                    ORDER BY updated_time DESC, id DESC
-                    LIMIT 1
-                    """
-                ),
-                {
-                    "account_id": int(account_id),
-                    "buyer_id": buyer_id,
-                    "item_id": item_id,
-                },
+    if buyer_id:
+        # 注意：xianyu_conversation 没有 deleted 列（历史实现误加 deleted=0，
+        # 导致补发通道每次都抛 OperationalError 1054 直接失败）。
+        # 会话表里的 peer 字段可能带 @goofish / sid: 前缀，商品字段可能为空，
+        # 因此用规范化后的对端 ID 匹配，并优先命中带该商品信息的会话。
+        normalized_buyer = buyer_id
+        for prefix in ("sid:",):
+            if normalized_buyer.startswith(prefix):
+                normalized_buyer = normalized_buyer[len(prefix):]
+        normalized_buyer = normalized_buyer.removesuffix("@goofish")
+        try:
+            rows = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT s_id, goods_id
+                        FROM xianyu_conversation
+                        WHERE account_id = :account_id
+                          AND (
+                            REPLACE(REPLACE(COALESCE(peer_external_uid, ''), 'sid:', ''), '@goofish', '') = :buyer_id
+                            OR REPLACE(REPLACE(COALESCE(external_buyer_id, ''), 'sid:', ''), '@goofish', '') = :buyer_id
+                          )
+                          AND COALESCE(s_id, '') NOT IN ('', '1')
+                        ORDER BY (COALESCE(goods_id, '') = :item_id) DESC,
+                                 updated_time DESC, id DESC
+                        LIMIT 5
+                        """
+                    ),
+                    {
+                        "account_id": int(account_id),
+                        "buyer_id": normalized_buyer,
+                        "item_id": item_id,
+                    },
+                )
+            ).mappings().all()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "delivery_recovery 会话查询失败 accountId=%d errorType=%s",
+                int(account_id),
+                type(exc).__name__,
             )
-        ).mappings().first()
-        if row and row.get("s_id"):
-            return str(row["s_id"])
+            rows = []
+        for row in rows:
+            if row.get("s_id"):
+                return str(row["s_id"])
     # 合成稳定 session_id：recovery:{account_id}:{buyer_id}:{item_id}
     return f"recovery:{int(account_id)}:{buyer_id}:{item_id}"
 
@@ -834,6 +854,80 @@ async def _resurrect_dead_letter_attempts(db: AsyncSession, *, max_age_hours: in
     if resurrected > 0:
         logger.info("resurrected dead letter attempts count=%d", resurrected)
     return resurrected
+
+
+def _pay_delivery_enabled(config_json: Any) -> bool:
+    """判断 delivery_goods_config.config_json 是否开启了付款后自动发货。"""
+    if isinstance(config_json, (bytes, bytearray)):
+        config_json = config_json.decode("utf-8", errors="ignore")
+    if isinstance(config_json, str):
+        try:
+            config_json = json.loads(config_json or "{}")
+        except (ValueError, TypeError):
+            return False
+    if not isinstance(config_json, dict):
+        return False
+    section = config_json.get("payDelivery")
+    if not isinstance(section, dict):
+        return False
+    enabled = section.get("enabled")
+    if isinstance(enabled, str):
+        return enabled.strip().lower() in ("1", "true", "yes", "on")
+    return bool(enabled)
+
+
+async def _list_pay_delivery_accounts() -> list[int]:
+    """返回开启了「付款后自动发货」的活跃账号 ID 列表。"""
+    async with async_session() as db:
+        rows = (
+            await db.execute(
+                text(
+                    """
+                    SELECT DISTINCT g.account_id
+                    FROM delivery_goods_config gc
+                    INNER JOIN xianyu_goods g
+                      ON g.id = gc.goods_id
+                     AND g.deleted = 0
+                    INNER JOIN xianyu_account acc
+                      ON acc.id = g.account_id
+                     AND acc.status = 1
+                     AND acc.deleted = 0
+                    WHERE gc.deleted = 0
+                      AND COALESCE(gc.config_json, '') LIKE '%payDelivery%'
+                    """
+                )
+            )
+        ).mappings().all()
+    return [int(row["account_id"]) for row in rows if row.get("account_id")]
+
+
+async def sync_delivery_account_orders() -> list[dict[str, Any]]:
+    """为开启自动发货的账号拉取一次最新已售订单（HTTP 接口）。
+
+    背景：WS 掉线/丢消息时，付款事件只能靠 HTTP 订单接口兜底。旧实现只在
+    「WS 收到消息」时才触发订单同步，WS 一旦卡住就彻底没有兜底数据源。
+    """
+    from .xianyu_order_sync import sync_orders_for_account
+
+    account_ids = await _list_pay_delivery_accounts()
+    results: list[dict[str, Any]] = []
+    for account_id in account_ids:
+        try:
+            result = await asyncio.wait_for(
+                sync_orders_for_account(account_id=account_id), timeout=120
+            )
+        except asyncio.TimeoutError:
+            result = {"success": False, "error": "订单同步超时"}
+        except Exception as exc:  # noqa: BLE001
+            result = {"success": False, "error": type(exc).__name__}
+        if not result.get("success"):
+            logger.warning(
+                "delivery_recovery 订单同步失败 accountId=%d error=%s",
+                account_id,
+                result.get("errorCode") or result.get("error"),
+            )
+        results.append({"accountId": account_id, **result})
+    return results
 
 
 async def run_delivery_recovery_once(

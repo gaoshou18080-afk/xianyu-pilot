@@ -63,16 +63,33 @@ def _map_order_status(raw_status: Any, in_refund: bool = False) -> int:
     return _ORDER_STATUS_MAP.get(status_text, 1)
 
 
+# 闲鱼接口返回的时间是北京时间（UTC+8），而服务器/数据库可能不是 +08，
+# 直接入库会造成 pay_time 偏移甚至落在"未来"，使补发扫描（pay_time <= NOW()-N）
+# 永远扫不到订单。
+_PLATFORM_TZ = datetime.timezone(datetime.timedelta(hours=8))
+
+
 def _parse_order_time(value: Any) -> Optional[datetime.datetime]:
-    """解析闲鱼订单时间字段，支持 'YYYY-MM-DD HH:MM:SS' 和 'YYYY-MM-DD'。"""
+    """解析闲鱼订单时间字段，支持 'YYYY-MM-DD HH:MM:SS' 和 'YYYY-MM-DD'。
+
+    平台时间按北京时间解析，再转换成服务器本地时区的 naive datetime。
+    """
     text_val = _text(value)
     if not text_val:
         return None
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
         try:
-            return datetime.datetime.strptime(text_val, fmt)
+            parsed = datetime.datetime.strptime(text_val, fmt)
         except ValueError:
             continue
+        try:
+            return (
+                parsed.replace(tzinfo=_PLATFORM_TZ)
+                .astimezone()
+                .replace(tzinfo=None)
+            )
+        except Exception:  # noqa: BLE001
+            return parsed
     return None
 
 
@@ -163,7 +180,13 @@ def _parse_remote_order_item(item: dict[str, Any]) -> Optional[dict[str, Any]]:
         "buyer_name": _text(buyer_info.get("userNick") or buyer_info.get("name")),
         "buyer_id": _text(buyer_info.get("buyerId")),
         "create_time": _parse_order_time(common.get("createTime")),
-        "pay_time": _parse_order_time(common.get("payTime") or common.get("paymentTime")),
+        # 平台实际字段是 paySuccessTime（付款成功时间），旧实现只读 payTime/paymentTime，
+        # 导致 pay_time 恒为 NULL，订单补发通道（要求 pay_time IS NOT NULL）永远扫不到单。
+        "pay_time": _parse_order_time(
+            common.get("paySuccessTime")
+            or common.get("payTime")
+            or common.get("paymentTime")
+        ),
         "ship_time": _parse_order_time(
             common.get("deliveryTime") or common.get("consignTime") or common.get("shipTime")
         ),

@@ -95,6 +95,44 @@ async def _lookup_account_name_safe(account_id: int) -> str:
     return str(account_id)
 
 
+_WATERMARK_MIN_US = 1_000_000_000_000  # 合理微秒时间戳下限（约 2001 年）
+
+
+def _extract_sync_watermarks(data: Any) -> tuple[int, int]:
+    """递归提取同步响应中的 (maxPts, maxHighPts) 水印（微秒）。
+
+    平台把水印包在不同层级（body / body.syncPushPackage / 其他包装），
+    旧实现只读 ``body.syncPushPackage.maxPts``，实际拿不到值，导致同步游标
+    永远停在启动时间。这里在整棵响应树里找水位字段。
+    """
+    max_pts = 0
+    max_high_pts = 0
+    stack = [data]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+                    continue
+                name = str(key)
+                if name not in ("maxPts", "highPts", "maxHighPts"):
+                    continue
+                try:
+                    num = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if num < _WATERMARK_MIN_US:
+                    continue
+                if name == "maxPts" and num > max_pts:
+                    max_pts = num
+                elif num > max_high_pts:
+                    max_high_pts = num
+        elif isinstance(node, list):
+            stack.extend(node)
+    return max_pts, max_high_pts
+
+
 class _ThreadedWebSocketAdapter:
     """基于 websocket-client 的最小异步适配层。"""
 
@@ -1615,19 +1653,15 @@ class XianyuWebSocketClient:
         # 提取同步响应中的高点水印
         if is_ack_diff:
             try:
-                body = data.get("body", {})
-                if isinstance(body, dict):
-                    sync_push = body.get("syncPushPackage") or body
-                    max_high_pts = sync_push.get("maxHighPts", 0)
-                    max_pts = sync_push.get("maxPts", 0)
-                    if max_high_pts:
-                        self._sync_high_pts = max_high_pts
-                    if max_pts:
-                        self._sync_pts = max_pts
-                    logger.info(
-                        "WS ackDiff 响应 accountId=%d maxHighPts=%s maxPts=%s",
-                        self.account_id, max_high_pts, max_pts
-                    )
+                max_pts, max_high_pts = _extract_sync_watermarks(data)
+                if max_high_pts and max_high_pts > self._sync_high_pts:
+                    self._sync_high_pts = max_high_pts
+                if max_pts and max_pts > self._sync_pts:
+                    self._sync_pts = max_pts
+                logger.info(
+                    "WS ackDiff 响应 accountId=%d maxHighPts=%s maxPts=%s",
+                    self.account_id, max_high_pts, max_pts
+                )
             except Exception as exc:
                 logger.warning(
                     "WS ackDiff 响应解析异常 accountId=%d errorType=%s",
@@ -1653,6 +1687,28 @@ class XianyuWebSocketClient:
             return
 
         logger.info("WS 收到 %d 条消息 accountId=%d", len(messages), self.account_id)
+
+        # 0. 推进同步游标（关键）：平台按 pts 返回"该点之后"的消息，且单批有上限。
+        # 旧实现只在 _sync_pts<=0 时赋值一次，此后永不推进，导致每轮都拿到同一批
+        # 老消息（重复入库被丢弃），新消息被挤到分页之外永远收不到。
+        # 这里用本批消息的最大 messageTime（毫秒）+1ms 作为下一轮 pts（微秒）。
+        latest_ms = 0
+        for item in messages:
+            try:
+                ts_ms = int(item.get("messageTime") or 0)
+            except (TypeError, ValueError):
+                ts_ms = 0
+            if ts_ms > latest_ms:
+                latest_ms = ts_ms
+        if latest_ms > 0:
+            next_pts = latest_ms * 1000 + 1000
+            if next_pts > self._sync_pts:
+                self._sync_pts = next_pts
+                logger.debug(
+                    "WS 同步游标推进 accountId=%d pts=%s",
+                    self.account_id,
+                    self._sync_pts,
+                )
 
         # 1. 回复 ACK
         for pnm_id in ack_ids:

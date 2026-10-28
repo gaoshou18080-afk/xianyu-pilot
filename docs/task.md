@@ -172,3 +172,29 @@ tail -f output/local-dev/api.out.log
   必要时调 `DELIVERY_RECOVERY_CHAT_LOOKBACK_HOURS`、`DELIVERY_RECOVERY_CHAT_SKIP_HUMAN_REPLY`
   或直接 `DELIVERY_RECOVERY_CHAT_ENABLED=false`。
 - 详细背景见 `docs/bugs.md` 的三条 2026-10-26 记录（配置被写成停用 / 漏单机制缺口 / 本轮修复）。
+
+## 自动发货与"人工干预"关系调查（2026-10-28，只读，无代码改动）
+
+- 结论：**实时自动发货没有任何"人工干预/人工说话就不发货"的逻辑**；只有兜底补发的「聊天消息通道」有 6 小时卖家 OUT 消息安全阀，兜底「订单通道」没有。
+- AI 自动回复的三层人工接管（`auto_reply_paused` 60 秒、`humanInterventionPauseMinutes` 默认 30 分钟、`mode=manual`）与发货完全解耦。
+- 线上实证：`realtime_delivery_attempt.id=40`（会话 `68535169526`）在卖家人工回复"对，官方中转"1 分钟后买家付款，系统照常自动发卡；attempt 25/29/30 同样如此。
+- 附带发现：生产库 `auto_reply_paused=1` 为 0 条、`last_manual_reply_at` 全 NULL，人工 OUT 暂停逻辑实际未落库（待修）。
+- 详见 `docs/business/auto-delivery.md`。
+
+## 自动发货"秒级"延迟调查（2026-10-28，只读，无代码改动）
+
+- 实测：平台付款 → 我们落库 p50 约 10s、p90 约 30s（acc3 今日平均 18s / max 33s）；我们内部链路 0~1s。
+- 根因①`ws_client.py` 的 `_sync_pts` 永不前进（`maxPts/highPts` 解析位置错误）→ 每 35s 重放 77~102 条老消息，
+  付款卡片要等窗口滑到（10~30s）。根因②每 32s 主动重连的离线窗口 p50 2s / p90 9s / max 13s（close 等 5s+5s）。
+- 修复计划 P0 游标 / P1 close 卡顿 / P2 处理解耦 / P3 预热双连 / P4 HTTP 轮询兜底；验证指标：
+  `收到 N 条消息` 降到 0~3 条、`created_time-message_time` p90 < 3s。
+- 详见 `docs/bugs.md` 2026-10-28 条目。
+
+## 2026-10-29 acc3 测试单无反应：WS 游标冻结 + 订单兜底三处缺陷（已修复）
+
+- 现象：acc3 商品 `1096807048573` 已配自动发货，01:01:01 付款，9 分钟无反应。
+- 平台侧订单真实存在（`5127895009054122526`，待发货）；我们库里没有消息、没有订单、没有 attempt。
+- 四处缺陷：WS `_sync_pts` 冻结回放old消息 / acc3 无订单同步数据源 / `paySuccessTime` 没解析 / 时间 +08→+07 错位 /
+  `xianyu_conversation` 无 `deleted` 列导致订单兜底必然异常。
+- 已修复：游标推进、时间字段与时间区转换、会话查询 SQL、补发循环内嵌 HTTP 订单同步、AI 陈旧消息守卫。
+- 详见 `docs/bugs.md` 2026-10-29 条目。

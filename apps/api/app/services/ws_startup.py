@@ -11,6 +11,7 @@ import time
 from sqlalchemy import text
 
 from ..core.cookie_crypto import decrypt_cookie_if_needed
+from ..core.config import settings
 from ..core.database import async_session
 from .ai_reply_batcher import (
     AiAutoReplyBatcher,
@@ -351,6 +352,24 @@ async def execute_message_automation_claim(
         return "completed"
     if claim.branch != "ai":
         raise NonRetryableOutboxError("unsupported_automation_branch")
+
+    # 陈旧消息守卫：WS 断线补偿/同步游标推进时会一次性回放历史消息，
+    # 对很久以前的旧消息再触发 AI 回复会造成半夜骚扰买家，直接跳过。
+    max_age_seconds = int(getattr(settings, "ai_reply_max_message_age_seconds", 900) or 0)
+    if max_age_seconds > 0:
+        try:
+            message_time_ms = int(msg.get("messageTime") or 0)
+        except (TypeError, ValueError):
+            message_time_ms = 0
+        if message_time_ms > 0:
+            age_seconds = int(time.time() - message_time_ms / 1000)
+            if age_seconds > max_age_seconds:
+                logger.info(
+                    "AI reply skipped for stale message accountId=%d ageSeconds=%d",
+                    claim.account_id,
+                    age_seconds,
+                )
+                return "completed"
 
     # Account identity is required to reject seller echoes safely.  A lookup
     # failure must be retried, never treated as if the packet came from a buyer.

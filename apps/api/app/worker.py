@@ -24,7 +24,10 @@ from .core.database import async_session
 from .core.logging_security import install_log_redaction
 from .migrations import assert_schema_current
 from .services.audit_retention import run_audit_retention_once
-from .services.delivery_recovery import run_delivery_recovery_once
+from .services.delivery_recovery import (
+    run_delivery_recovery_once,
+    sync_delivery_account_orders,
+)
 from .services.scheduled_task_runtime import get_scheduled_task_runtime
 
 logger = logging.getLogger(__name__)
@@ -121,6 +124,16 @@ async def run_delivery_recovery_forever(
         settings.delivery_recovery_min_age_seconds,
     )
     while not stop.is_set():
+        # 先通过 HTTP 订单接口拉一次最新已售订单，保证 WS 掉线/丢消息时
+        # 补发通道仍有新鲜的订单数据源（否则付款事件完全丢失）。
+        if settings.delivery_recovery_order_sync_enabled:
+            try:
+                synced = await sync_delivery_account_orders()
+                failed = [item for item in synced if not item.get("success")]
+                if failed:
+                    logger.warning("delivery_recovery order sync failures: %s", failed)
+            except Exception:
+                logger.error("delivery_recovery order sync failed", exc_info=True)
         try:
             result = await run_delivery_recovery_once()
             if result.get("scanned"):
