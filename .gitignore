@@ -63,3 +63,6 @@ restart-local.bat
 stop-all.bat
 start-local-windowed.bat
 scripts/restart-local.ps1
+
+# 本地 AI 协作说明（含凭据，禁止提交）
+AGENTS.md

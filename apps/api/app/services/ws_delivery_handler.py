@@ -456,7 +456,63 @@ async def handle_incoming_message_for_delivery(
             )
 
 
+_ORDER_DELIVERY_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _delivery_lock(key: str) -> asyncio.Lock:
+    """取（或创建）某个账号+订单的进程内串行锁。"""
+    lock = _ORDER_DELIVERY_LOCKS.get(key)
+    if lock is None:
+        if len(_ORDER_DELIVERY_LOCKS) > 512:
+            # 简单防膨胀：清空比泄漏锁对象更安全（锁只在极短窗口内有意义）
+            _ORDER_DELIVERY_LOCKS.clear()
+        lock = asyncio.Lock()
+        _ORDER_DELIVERY_LOCKS[key] = lock
+    return lock
+
+
 async def _process_delivery(
+    db: AsyncSession,
+    account_id: int,
+    msg: dict,
+) -> RealtimeDeliveryOutcome | None:
+    """同一账号+同一订单的并发触发串行化。
+
+    背景（2026-10-29 实测）：一单付款会连着收到 2 条付款相关消息，两条几乎同时
+    进入发货流程。两次去重查询都在对方写库前完成，于是同一订单建了两个 attempt
+    （47 failed unconfigured + 48 success）。虽然最终只发了一张卡密，但留下了
+    噪声 attempt 与重复告警。这里按 orderId 串行化：第二个触发会等第一个结束后
+    再走一遍去重，从而直接跳过。
+    """
+    order_key = (
+        str(msg.get("orderId") or msg.get("order_id") or "").strip()
+        or extract_order_id_from_message(msg)
+        or ""
+    )
+    if not order_key:
+        return await _process_delivery_inner(db, account_id, msg)
+
+    lock = _delivery_lock(f"{account_id}:{order_key}")
+    if lock.locked():
+        logger.info(
+            "同订单发货已在处理中，等待串行化 accountId=%d orderId=%s",
+            account_id, order_key,
+        )
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=120)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "同订单发货串行化等待超时，跳过本次触发 accountId=%d orderId=%s",
+            account_id, order_key,
+        )
+        return None
+    try:
+        return await _process_delivery_inner(db, account_id, msg)
+    finally:
+        lock.release()
+
+
+async def _process_delivery_inner(
     db: AsyncSession,
     account_id: int,
     msg: dict,
@@ -1477,7 +1533,8 @@ async def _find_duplicate_delivery(
                 await db.execute(
                     text(
                         """
-                        SELECT id, state, retry_safe
+                        SELECT id, state, retry_safe, last_error_code,
+                               TIMESTAMPDIFF(SECOND, created_time, NOW()) AS age_s
                         FROM realtime_delivery_attempt
                         WHERE account_id = :account_id
                           AND external_order_id = :order_id
@@ -1497,6 +1554,14 @@ async def _find_duplicate_delivery(
             state = str(row.get("state") or "")
             if state == "failed":
                 if int(row.get("retry_safe") or 0) == 1:
+                    return ""
+                # 配置类失败（规则/商品尚未就绪）在 3 分钟内允许重试：
+                # 实测付款消息比商品同步早到，首次触发可能查不到发货规则
+                # （delivery_mode_unavailable），1 秒后商品落库就能正常发货。
+                if (
+                    str(row.get("last_error_code") or "") == "delivery_mode_unavailable"
+                    and int(row.get("age_s") or 0) <= 180
+                ):
                     return ""
                 return "order_attempt_failed_not_retryable"
             return f"order_attempt_state_{state or 'unknown'}"

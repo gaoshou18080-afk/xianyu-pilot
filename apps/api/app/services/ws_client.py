@@ -12,6 +12,7 @@
 import asyncio
 import json
 import logging
+import os
 import ssl
 import threading
 import time
@@ -50,7 +51,13 @@ HEARTBEAT_INTERVAL = 15  # 心跳间隔（秒）
 # 重连延迟（秒）：平台侧会话上限约 35 秒（见 SESSION_MAX_SECONDS），
 # 原值 5 秒会让每个会话周期多损失 5 秒的入站消息（付款通知丢失）。
 # 2026-10-26 服务器 C 探针实测：建连/注册约 1.2 秒，故取 1 秒。
-RECONNECT_DELAY = 1
+# 2026-10-29 再收紧到 0.2 秒（实测建连+注册 ~0.5s），减少断线窗口。
+RECONNECT_DELAY = float(os.getenv("WS_RECONNECT_DELAY_SECONDS", "0.2"))
+# 主动 ackDiff 轮询间隔（秒）：这是"付款卡片到达延迟"的主要瓶颈。
+# 平台下发 syncPushPackage 是攒批的（实测付款卡片要等下一批才下发，
+# 延迟 0~30 秒抖动），靠响应触发的被动重同步在长轮询下可能几十分钟才回来。
+# 因此改为独立定时器主动轮询，目标 p90 < 2 秒。
+SYNC_POLL_INTERVAL = float(os.getenv("WS_SYNC_POLL_INTERVAL_SECONDS", "2"))
 # 平台会话上限（秒）：2026-10-26 六组对照探针实测，无论客户端是否持续
 # ackDiff 轮询 / 回服务端 /! 、是否刷新 token，连接建立后 36.3±0.2 秒
 # 必被服务端丢弃（无 close 帧）。因此在 32 秒时主动平滑重连，
@@ -291,14 +298,17 @@ class _ThreadedWebSocketAdapter:
         if ws_app:
             await asyncio.to_thread(ws_app.close)
 
+        # 关闭等待必须短：实测 ws_app.close() 后 on_close 偶发要 5 秒才回调、
+        # 线程 join 又要 3 秒，导致每 32 秒的会话回收里白丢 8 秒入站消息。
+        # 这里压到 1+1 秒，残余线程是 daemon 且已断开，不影响下次建连。
         if self._close_event:
             try:
-                await asyncio.wait_for(self._close_event.wait(), timeout=5)
+                await asyncio.wait_for(self._close_event.wait(), timeout=1)
             except asyncio.TimeoutError:
                 pass
 
         if thread and thread.is_alive():
-            await asyncio.to_thread(thread.join, 5)
+            await asyncio.to_thread(thread.join, 1)
 
         self._ws_app = None
         self._thread = None
@@ -339,6 +349,7 @@ class XianyuWebSocketClient:
         # 同步状态
         self._sync_pts = 0  # 当前同步基点时间戳
         self._sync_high_pts = 0  # 当前同步高点水印
+        self._sync_outstanding = 0  # 已发出但还没收到同步回包的请求数
         self._fail_streak = 0  # 连续连接失败次数（用于指数退避）
 
         # 外部回调（如消息存储）
@@ -919,6 +930,7 @@ class XianyuWebSocketClient:
 
         try:
             self.phase = "connecting"
+            self._sync_outstanding = 0
             logger.info("连接 WS accountId=%d 使用 websocket-client 底层实现", self.account_id)
             await ws.connect(timeout=10)
             self._ws = ws
@@ -1413,16 +1425,49 @@ class XianyuWebSocketClient:
         if self._sync_pts <= 0:
             self._sync_pts = int(time.time() * 1000000)  # 微秒
         msg = build_sync_message(self._sync_pts, self._sync_high_pts)
+        self._sync_outstanding += 1
         await ws.send(json.dumps(msg, ensure_ascii=False))
         logger.info(
             "WS 同步请求已发送 accountId=%d pts=%s highPts=%s",
             self.account_id, self._sync_pts, self._sync_high_pts
         )
 
+    async def _sync_loop(self, ws: _ThreadedWebSocketAdapter):
+        """主动 ackDiff 轮询循环（默认 2 秒）。
+
+        平台把聊天消息/付款卡片攒在 syncPushPackage 里批量下发，只靠"收到响应
+        再发下一轮"的被动链式同步时，付款卡片的到达延迟会在 0~30 秒之间抖动
+        （实测付款 00:31:46 → 落库 00:32:05，18 秒）。独立定时器主动轮询可以把
+        这个延迟压到 SYNC_POLL_INTERVAL 量级。
+        """
+        interval = max(0.5, float(SYNC_POLL_INTERVAL))
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                if self._ws is not ws or not self._connected:
+                    break
+                if self._sync_outstanding >= 3:
+                    # 平台侧长轮询还没回包，避免请求无限堆积
+                    continue
+                try:
+                    await self._do_sync(ws)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug(
+                        "WS 主动同步失败 accountId=%d errorType=%s",
+                        self.account_id,
+                        type(exc).__name__,
+                    )
+                    break
+        except asyncio.CancelledError:
+            raise
+
     async def _message_loop(self, ws: _ThreadedWebSocketAdapter):
         """消息接收循环，包含心跳。"""
         heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
         session_task = asyncio.create_task(self._session_recycle_loop(ws))
+        sync_task = asyncio.create_task(self._sync_loop(ws))
 
         try:
             while True:
@@ -1440,12 +1485,17 @@ class XianyuWebSocketClient:
         finally:
             heartbeat_task.cancel()
             session_task.cancel()
+            sync_task.cancel()
             try:
                 await heartbeat_task
             except asyncio.CancelledError:
                 pass
             try:
                 await session_task
+            except asyncio.CancelledError:
+                pass
+            try:
+                await sync_task
             except asyncio.CancelledError:
                 pass
 
@@ -1647,6 +1697,8 @@ class XianyuWebSocketClient:
 
     async def _handle_sync_package(self, data: dict, ws: _ThreadedWebSocketAdapter):
         """处理同步包（聊天消息）。"""
+        if self._sync_outstanding > 0:
+            self._sync_outstanding -= 1
         lwp = data.get("lwp", "")
         is_ack_diff = lwp == "/r/SyncStatus/ackDiff"
 
