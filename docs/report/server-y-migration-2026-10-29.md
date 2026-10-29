@@ -7,7 +7,8 @@
 项目 `xianyu-pilot` 已从误切换的服务器 W `104.234.177.211` 完整迁到服务器
 Y `47.114.95.251`。Cloudflare 域名已切换到 Y，Y 的 API、Worker、Crawler、
 Redis 和 Nginx 站点运行正常；W 的闲鱼专用资源已全部清理，W 上的其他项目未停止
-或修改。
+或修改。Y 位于阿里云杭州节点，域名备案合规拦截导致当前外部 HTTPS 尚不可用，
+这是本次上线剩余的唯一外部访问阻塞。
 
 | 项目 | 源 W | 目标 Y |
 | --- | --- | --- |
@@ -36,8 +37,10 @@ Redis 和 Nginx 站点运行正常；W 的闲鱼专用资源已全部清理，W 
 - API `/health/edge-ready`：`{"status":"ready"}`。
 - Crawler `/health`：`{"status":"ok","service":"xianyu-crawler"}`。
 - Worker check 退出码 0，调度器和发货恢复循环均启动。
-- HTTP 公网 301 到 HTTPS；首页、静态资源、`/healthz`、`/readyz` 和登录接口
-  状态符合预期。
+- Y 本机访问自身公网 IP：HTTP 301 到 HTTPS，HTTPS 首页、静态资源、
+  `/healthz`、`/readyz` 和登录接口状态符合预期。
+- 开发机和 W 外部访问：80 返回 `403 Non-compliance ICP Filing`，443 在 TLS
+  ClientHello 阶段被重置；确认拦截发生在阿里云网络入口，不在 Nginx/应用。
 - Cloudflare、Google、阿里 DNS 均返回 `47.114.95.251`。
 - Cloudflare A 记录 TTL 60、DNS-only。
 - 证书 CN `xianyu.enjoygoo.win`，有效期至 2027-01-27，自动续期 timer active。
@@ -55,6 +58,8 @@ Redis 和 Nginx 站点运行正常；W 的闲鱼专用资源已全部清理，W 
 
 ## 已知风险
 
+- **上线阻塞**：`enjoygoo.win` 尚未完成阿里云杭州节点要求的 ICP 备案接入。
+  外部用户当前无法访问；需完成备案或改用已备案域名后重新从开发机/W验收。
 - 账号 1 因出口 IP 改变报告 `SESSION_EXPIRED`，需要在 Y 的页面重新登录并完成
   滑块/授权；这是平台会话失效，不是迁移缺失。
 - Y 物理内存约 1.7GB，已配置 2GB Swap。Crawler 必须保持

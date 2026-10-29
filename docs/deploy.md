@@ -619,7 +619,8 @@ systemctl reload nginx
 ```
 
 Y 阿里云安全组必须放行入方向 TCP 80/443（源 `0.0.0.0/0`）。放行前从开发机、
-W、C 和外部检测节点均确认超时；放行后 Y 的 HTTP/HTTPS 公网回源成功。
+W、C 和外部检测节点均确认超时；放行后 Y 本机访问自身公网 IP 得到 HTTP 301
+和 HTTPS 200。
 
 ### 5. DNS 切换与验收
 
@@ -640,9 +641,12 @@ curl -fsS --resolve xianyu.enjoygoo.win:443:47.114.95.251 \
   https://xianyu.enjoygoo.win/readyz
 ```
 
-验收结果：HTTP 301 到 HTTPS，首页与静态资源 200，`/readyz`
-`{"status":"ready"}`，登录接口 GET 返回预期的 405，证书有效期至
-2027-01-27，DNS-01 续期 dry-run 通过。
+2026-10-29 外部复验结果：开发和 W 访问 Y 的 80 返回阿里云
+`403 Non-compliance ICP Filing`，443 在 TLS ClientHello 阶段被重置；Y 本机
+回环和自身公网 IP 回源正常。该拦截位于阿里云网络入口，不能通过调整 Nginx
+解决。`enjoygoo.win` 完成 ICP 备案接入或改用已备案域名后，必须从开发机和 W
+重新验证 HTTP 301、首页/静态资源 200、`/readyz` ready、登录接口 GET 405；
+最后再验证证书有效期和 DNS-01 续期。
 
 ### 6. W 闲鱼资源清理
 

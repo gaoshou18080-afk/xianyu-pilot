@@ -16,6 +16,10 @@
   站点保持运行。
 - Cloudflare A 记录当前指向 Y，TTL 60，DNS-only；源站安全组必须放行
   TCP 80/443。
+- Y 位于阿里云杭州节点，`xianyu.enjoygoo.win` 当前受到未备案域名拦截：
+  外部访问 80 返回 `403 Non-compliance ICP Filing`，443 握手被重置。Y 本机
+  回环访问正常，不代表公网可用；在完成 ICP 备案接入或改用已备案域名前，
+  外部用户无法访问。
 
 ## 运行约束
 

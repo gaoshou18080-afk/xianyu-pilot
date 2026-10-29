@@ -233,8 +233,8 @@ tail -f output/local-dev/api.out.log
   快照，并安装 Node 22.23.1、Python 3.12.16、venv、Crawler 依赖和 Playwright
   Chromium；真实浏览器启动测试通过。
 - Y 的 `xianyu-redis`、`xianyu-api`、`xianyu-worker`、`xianyu-crawler` 均已启用；
-  API `/health/edge-ready`、Crawler `/health`、Worker check 和公网 `/readyz`
-  全部通过。
+  API `/health/edge-ready`、Crawler `/health`、Worker check 和 Nginx
+  回环 `/readyz` 全部通过。
 - MySQL 补齐 `xianyu_app@localhost` 的本库最小 DDL 权限，解决运行时创建
   `xianyu_captcha_backoff` 被拒绝的问题。
 - Cloudflare A 记录已从 W `104.234.177.211` 切到 Y `47.114.95.251`，
@@ -243,5 +243,8 @@ tail -f output/local-dev/api.out.log
   W 的 Nginx/MySQL/PHP 保持 active，`shop.enjoygoo.win`、`pdd.enjoygoo.win`
   等其他站点复验均为 200。
 - C/W 均无活动闲鱼 Worker/Crawler，消除了同账号双活、重复消费和重复发货风险。
+- **公网访问阻塞**：开发机和 W 访问 Y 的 80/443 被阿里云 ICP 合规策略拦截
+  （80 为 `403 Non-compliance ICP Filing`，443 被重置）；Y 本机访问公网地址
+  正常。需完成 `enjoygoo.win` 的 ICP 备案接入，或改用已备案域名后再做外部验收。
 - 账号 1 因出口 IP 改变仍为 `SESSION_EXPIRED`，需在 Y 的页面重新登录并完成滑块授权。
 - 详见 `docs/report/server-y-migration-2026-10-29.md` 和 `docs/deploy.md`。

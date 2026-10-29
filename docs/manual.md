@@ -144,6 +144,9 @@ dig +short @1.1.1.1 xianyu.enjoygoo.win A
 ```
 
 Cloudflare A 记录为 TTL 60、DNS-only。阿里云安全组必须放行 TCP 80/443。
+当前 `xianyu.enjoygoo.win` 仍受阿里云杭州节点 ICP 合规拦截：外部 80 返回
+`403 Non-compliance ICP Filing`，443 被重置；Y 本机回环正常。完成域名备案
+接入或更换为已备案域名后，公网验收才成立。
 
 检查证书和自动续期：
 
@@ -157,6 +160,9 @@ certbot renew --cert-name xianyu.enjoygoo.win \
 续期使用 `/etc/letsencrypt/cloudflare.ini` 和 `/etc/letsencrypt/accounts/`，
 不依赖 A 记录或 HTTP-01。迁移或恢复证书时必须同时保留 live、archive、
 renewal、accounts 和 Cloudflare 凭据。
+
+如果外部访问出现 `Server: Beaver` 或 443 ClientHello 重置，但 Y 本机
+Nginx 正常，应优先检查阿里云 ICP 合规状态，不要修改共享 Nginx 配置。
 
 ## 回滚
 
