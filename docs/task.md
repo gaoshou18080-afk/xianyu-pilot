@@ -247,4 +247,7 @@ tail -f output/local-dev/api.out.log
   （80 为 `403 Non-compliance ICP Filing`，443 被重置）；Y 本机访问公网地址
   正常。需完成 `enjoygoo.win` 的 ICP 备案接入，或改用已备案域名后再做外部验收。
 - 账号 1 因出口 IP 改变仍为 `SESSION_EXPIRED`，需在 Y 的页面重新登录并完成滑块授权。
+- 因域名 ICP 拦截，Y 已新增闲鱼专用临时入口 `http://47.114.95.251`，保留
+  同源 API、上传和 SSE；其他域名及 Y 默认站点不受影响。该入口为明文 HTTP，
+  仅作备案阻塞期间的受限临时访问。
 - 详见 `docs/report/server-y-migration-2026-10-29.md` 和 `docs/deploy.md`。

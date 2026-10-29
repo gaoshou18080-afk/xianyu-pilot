@@ -529,6 +529,31 @@ Nginx 站点和四个 xianyu 单元；禁止两个节点同时消费同一批闲
 
 ## 版本 `8fc2fc8` <=> 服务器 W 到 Y 完整迁移（2026-10-29，当前生产）
 
+### 临时 IP HTTP 入口（2026-10-29）
+
+阿里云对 `xianyu.enjoygoo.win` 实施未备案域名拦截，但纯 IP Host 可访问。
+在 Y 的闲鱼专用 Nginx 配置中新增 `47.114.95.251:80` server，不修改默认
+站点或其他业务站点：
+
+```sh
+scp deploy/server-c/nginx-xianyu.enjoygoo.win.conf \
+  root@47.114.95.251:/etc/nginx/sites-available/xianyu.enjoygoo.win
+ssh root@47.114.95.251 '
+  nginx -t &&
+  systemctl reload nginx &&
+  curl -fsS http://127.0.0.1/healthz &&
+  curl -fsS -H "Host: 47.114.95.251" http://127.0.0.1/readyz
+'
+```
+
+入口为 `http://47.114.95.251`。Nginx 将 `/api/`、`/readyz` 和
+`/uploads/` 的上游 Host 重写为 `xianyu.enjoygoo.win`，SSE 关闭
+`proxy_buffering` 且读取超时为 65 分钟。只 reload Nginx，不停止或重启
+共享 Nginx/MySQL/PHP/Redis。
+
+回滚：删除该 Nginx 文件中 `server_name 47.114.95.251` 的 server 块，
+执行 `nginx -t && systemctl reload nginx`。不得删除域名 80/443 server。
+
 目标节点最终确认为服务器 Y `47.114.95.251`。W `104.234.177.211` 是先前误切换
 产生的中间节点，本次已将闲鱼项目完整迁到 Y，并从 W 清理全部闲鱼专用资源。
 迁移期间未停止 W 的 Nginx/MySQL/PHP，也未修改 W 其他站点。

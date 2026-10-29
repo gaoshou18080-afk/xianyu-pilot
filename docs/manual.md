@@ -11,6 +11,7 @@
 - Web：Nginx 托管 `/var/www/xianyu/apps/web/dist`
 - API：`127.0.0.1:15177`
 - Crawler：`127.0.0.1:15178`
+- 临时 IP HTTP：`http://47.114.95.251`（仅闲鱼站点，无 TLS）
 - HTTPS：公网 `443`，由 Nginx 终止 TLS
 - Redis：`127.0.0.1:16379`，systemd 服务 `xianyu-redis`
 - MySQL：本机 `127.0.0.1:3306`，数据库 `xianyu_opensource`
@@ -62,6 +63,7 @@ cd /var/www/xianyu/apps/api
 公网检查应从非 Y 的机器执行，或使用固定回源：
 
 ```sh
+curl -fsS http://47.114.95.251/readyz
 curl -I --resolve xianyu.enjoygoo.win:80:47.114.95.251 \
   http://xianyu.enjoygoo.win/
 curl -fsS --resolve xianyu.enjoygoo.win:443:47.114.95.251 \
@@ -147,6 +149,11 @@ Cloudflare A 记录为 TTL 60、DNS-only。阿里云安全组必须放行 TCP 80
 当前 `xianyu.enjoygoo.win` 仍受阿里云杭州节点 ICP 合规拦截：外部 80 返回
 `403 Non-compliance ICP Filing`，443 被重置；Y 本机回环正常。完成域名备案
 接入或更换为已备案域名后，公网验收才成立。
+
+`http://47.114.95.251` 是仅使用 IP Host 的临时入口，阿里云不会按未备案域名
+拦截。Nginx 将 API 上游 Host 重写为 `xianyu.enjoygoo.win`，以通过应用
+`TRUSTED_HOSTS` 校验；SSE 已关闭代理缓冲。该入口明文传输登录 Token 和业务
+数据，仅用于备案阻塞期间的受限临时访问，不应作为长期生产入口。
 
 检查证书和自动续期：
 
