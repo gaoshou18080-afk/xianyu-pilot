@@ -1,10 +1,11 @@
-# 服务器 W 裸机运维手册
+# 服务器 Y 裸机运维手册
 
 ## 基本信息
 
 - 域名：`xianyu.enjoygoo.win`
-- 服务器：W / `104.234.177.211` / 新加坡
-- SSH：`ssh -i /var/www/sshkey/serv_w guanli@104.234.177.211`
+- 服务器：Y / `47.114.95.251` / 阿里云杭州
+- SSH：`ssh root@47.114.95.251`
+- 系统：Ubuntu 22.04.5 LTS
 - 部署目录：`/var/www/xianyu`
 - 运行方式：裸机，不使用 Docker
 - Web：Nginx 托管 `/var/www/xianyu/apps/web/dist`
@@ -13,6 +14,9 @@
 - HTTPS：公网 `443`，由 Nginx 终止 TLS
 - Redis：`127.0.0.1:16379`，systemd 服务 `xianyu-redis`
 - MySQL：本机 `127.0.0.1:3306`，数据库 `xianyu_opensource`
+
+Y 还承载其他业务。发布只允许 reload Nginx，不得重启或停止共用
+Nginx/MySQL/PHP/Redis，也不得修改其他站点。
 
 ## 服务与文件
 
@@ -23,11 +27,12 @@
 | Crawler systemd | `/etc/systemd/system/xianyu-crawler.service` |
 | Redis systemd | `/etc/systemd/system/xianyu-redis.service` |
 | Redis 配置 | `/etc/redis/xianyu.conf` |
+| Redis 密码 | `/etc/redis/xianyu-secret.conf` |
 | Nginx 站点 | `/etc/nginx/sites-enabled/xianyu.enjoygoo.win` |
 | 环境变量 | `/var/www/xianyu/.env` |
 | secrets | `/var/www/xianyu/secrets/` |
 | Cloudflare DNS 凭据 | `/etc/letsencrypt/cloudflare.ini`，`0600 root:root` |
-| Python venv | `/var/www/xianyu/.venv/` |
+| Python | `/opt/python3.12`，项目 venv 为 `/var/www/xianyu/.venv/` |
 | Node.js | `/opt/node22/bin/node` |
 | Playwright Chromium | `/home/guanli/.cache/ms-playwright` |
 | Scheduler 心跳 | `/tmp/xianyu-scheduler-heartbeat` |
@@ -35,26 +40,32 @@
 API 与 Worker 不使用 `PrivateTmp`，二者必须共享同一个系统 `/tmp`，否则 Worker
 写出的调度器心跳无法被其他进程读取。
 
+MySQL 应用连接虽然配置为 `127.0.0.1`，服务端实际按
+`xianyu_app@localhost` 匹配。该账号只应拥有 `xianyu_opensource.*` 的
+`SELECT/INSERT/UPDATE/DELETE/CREATE/ALTER/INDEX`。
+
 ## 状态检查
 
 ```sh
-ssh -i /var/www/sshkey/serv_w guanli@104.234.177.211
-free -m
-systemctl status --no-pager xianyu-redis xianyu-api xianyu-worker xianyu-crawler nginx
+ssh root@47.114.95.251
+free -h
+swapon --show
+systemctl status --no-pager \
+  xianyu-redis xianyu-api xianyu-worker xianyu-crawler nginx mysql php8.4-fpm
 ss -ltnp | grep -E '15177|15178|16379|:80 |:443 '
-curl -fsS http://127.0.0.1:15177/health/ready
-curl -fsS http://127.0.0.1:15178/ready
+curl -fsS http://127.0.0.1:15177/health/edge-ready
+curl -fsS http://127.0.0.1:15178/health
 cd /var/www/xianyu/apps/api
 ../../.venv/bin/python -m app.worker --check
 ```
 
-边缘健康检查：
+公网检查应从非 Y 的机器执行，或使用固定回源：
 
 ```sh
-curl --resolve xianyu.enjoygoo.win:80:104.234.177.211 \
-  http://xianyu.enjoygoo.win/healthz
-curl --resolve xianyu.enjoygoo.win:80:104.234.177.211 \
-  http://xianyu.enjoygoo.win/readyz
+curl -I --resolve xianyu.enjoygoo.win:80:47.114.95.251 \
+  http://xianyu.enjoygoo.win/
+curl -fsS --resolve xianyu.enjoygoo.win:443:47.114.95.251 \
+  https://xianyu.enjoygoo.win/readyz
 ```
 
 ## 日志与重启
@@ -65,8 +76,15 @@ journalctl -u xianyu-worker -n 100 --no-pager
 journalctl -u xianyu-crawler -n 100 --no-pager
 journalctl -u xianyu-redis -n 100 --no-pager
 
-sudo systemctl restart xianyu-api xianyu-worker xianyu-crawler
-sudo systemctl reload nginx
+systemctl restart xianyu-api xianyu-worker xianyu-crawler
+systemctl reload nginx
+```
+
+正常 Worker 日志应包含：
+
+```text
+scheduler worker started interval=15s batch=20 timeout=300s
+delivery_recovery loop started interval=15s batch=50 minAge=10s
 ```
 
 ## 发布流程
@@ -81,31 +99,31 @@ npm --prefix apps/crawler run build
 ```
 
 3. 发布前检查 `docs/deploy.md` 中是否还有目标版本的非代码操作。
-4. 服务器只拉取代码，不执行 Vite/TypeScript 构建：
+4. 服务器只拉取代码，不执行 Vite/TypeScript 构建，也不在服务器提交代码：
 
 ```sh
-cd /var/www/xianyu
-git pull --ff-only
+ssh root@47.114.95.251
+sudo -u guanli git -C /var/www/xianyu pull --ff-only fork main
 ```
 
-5. 将本地 `dist` 发布包上传到对应目录并重启服务：
+5. 将本地 `dist` 发布包上传到 Y，再重启闲鱼服务：
 
 ```sh
-scp -i /var/www/sshkey/serv_w -r apps/web/dist/* \
-  guanli@104.234.177.211:/var/www/xianyu/apps/web/dist/
-scp -i /var/www/sshkey/serv_w -r apps/crawler/dist/* \
-  guanli@104.234.177.211:/var/www/xianyu/apps/crawler/dist/
-ssh -i /var/www/sshkey/serv_w guanli@104.234.177.211 \
-  'sudo systemctl restart xianyu-api xianyu-worker xianyu-crawler'
+scp -r apps/web/dist/* \
+  root@47.114.95.251:/var/www/xianyu/apps/web/dist/
+scp -r apps/crawler/dist/* \
+  root@47.114.95.251:/var/www/xianyu/apps/crawler/dist/
+ssh root@47.114.95.251 \
+  'systemctl restart xianyu-api xianyu-worker xianyu-crawler'
 ```
 
-6. 依次验证 API、Worker 心跳、Crawler、Nginx 和登录接口。
-7. 有 SQL、目录、权限、systemd、Nginx、Redis 等非代码变化时，登记
+6. 依次验证 API、Worker 心跳、Crawler、Nginx、公网 readiness 和登录接口。
+7. 有 SQL、目录、权限、systemd、Nginx、Redis、证书等非代码变化时，登记
    `docs/deploy.md`。
 
 ## 内存控制
 
-当前服务器物理内存约 3.9GB，Swap 为 0。Crawler 固定限制：
+当前物理内存约 1.7GB，另有 2GB Swap。Crawler 固定限制：
 
 ```dotenv
 CRAWLER_MAX_CONCURRENCY=1
@@ -114,7 +132,7 @@ CRAWLER_FORCE_HEADLESS=true
 ```
 
 不要在未评估内存的情况下提高并发。真实 Chromium 单次操作应保留至少
-500-800MB 余量；如果生产流量增加，优先扩容物理内存并配置 2-4GB Swap。
+500-800MB 余量；Swap 只用于短时兜底，不能替代物理内存扩容。
 
 ## DNS 与 TLS
 
@@ -122,35 +140,33 @@ DNS 正常指向：
 
 ```sh
 dig +short @1.1.1.1 xianyu.enjoygoo.win A
-# 应返回 104.234.177.211
+# 应返回 47.114.95.251
 ```
 
-服务器 W 已使用 Cloudflare DNS-01 提前签发
-`/etc/letsencrypt/live/xianyu.enjoygoo.win/` 证书。A 记录已切换到
-`104.234.177.211`，可用以下命令复查公网：
+Cloudflare A 记录为 TTL 60、DNS-only。阿里云安全组必须放行 TCP 80/443。
+
+检查证书和自动续期：
 
 ```sh
-curl -I http://xianyu.enjoygoo.win
-curl -I https://xianyu.enjoygoo.win
+certbot certificates --cert-name xianyu.enjoygoo.win
+systemctl status --no-pager certbot.timer
+certbot renew --cert-name xianyu.enjoygoo.win \
+  --dry-run --non-interactive --no-random-sleep-on-renew
 ```
 
-检查 80 到 443 跳转、证书域名和自动续期：
-
-```sh
-echo | openssl s_client -connect 104.234.177.211:443 \
-  -servername xianyu.enjoygoo.win 2>/dev/null |
-  openssl x509 -noout -subject -issuer -dates -ext subjectAltName
-sudo certbot renew --cert-name xianyu.enjoygoo.win --dry-run
-```
-
-证书续期使用 `/etc/letsencrypt/cloudflare.ini`，不依赖 A 记录或 HTTP-01。
+续期使用 `/etc/letsencrypt/cloudflare.ini` 和 `/etc/letsencrypt/accounts/`，
+不依赖 A 记录或 HTTP-01。迁移或恢复证书时必须同时保留 live、archive、
+renewal、accounts 和 Cloudflare 凭据。
 
 ## 回滚
 
 ```sh
 cd /var/www/xianyu
-git switch --detach <上一个正常版本>
-sudo systemctl restart xianyu-api xianyu-worker xianyu-crawler
+sudo -u guanli git switch --detach <上一个正常版本>
+systemctl restart xianyu-api xianyu-worker xianyu-crawler
 ```
 
 如果版本包含数据库迁移，回滚代码前必须确认迁移可逆或数据库向后兼容。
+完整迁移快照保存在
+`/var/www/vm_share/yuenan/xianyu-w-to-y-20261029/`。任何回滚节点启动前必须先
+停止 Y 的 Worker/Crawler，禁止同账号双活。

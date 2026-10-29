@@ -1,5 +1,57 @@
 # 问题与踩坑记录（docs/bugs.md）
 
+## 2026-10-29：迁移到 Y 后应用账号无法创建运行时表
+
+**现象**
+
+- API readiness 为 ready，但日志持续出现
+  `CREATE command denied to user 'xianyu_app'@'localhost'`，目标表为
+  `xianyu_captcha_backoff`。
+- 迁移脚本原先只创建并授权了 `xianyu_app@127.0.0.1`。
+
+**原因**
+
+- `.env` 虽然连接 `MYSQL_HOST=127.0.0.1`，MySQL 仍将连接识别为
+  `xianyu_app@localhost`，实际使用 `localhost` 身份。
+- 应用启动时会 `CREATE TABLE IF NOT EXISTS` 滑块退避表，仅 CRUD 权限不足。
+
+**处理**
+
+- 创建同密码的 `xianyu_app@localhost`，只授权
+  `xianyu_opensource.*` 的 `SELECT/INSERT/UPDATE/DELETE/CREATE/ALTER/INDEX`。
+- 重启后表成功创建，API 日志不再出现权限拒绝。
+
+## 2026-10-29：TLS 证书迁移后 certbot 无法续期
+
+**现象**
+
+- Y 已有证书、私钥和 renewal 配置，`certbot renew --dry-run` 仍要求注册账户。
+- 首次安装 certbot 后没有 `/etc/letsencrypt/accounts` 中的账户数据。
+
+**处理**
+
+- 从 W 迁移 `/etc/letsencrypt/accounts`，保留 `root:root` 和 `private_key.json`
+  的 `0400` 权限。
+- Y 安装 `certbot python3-certbot-dns-cloudflare`，使用
+  `--no-random-sleep-on-renew` 完成 DNS-01 dry-run。
+
+**教训**
+
+- TLS 迁移必须同时检查 live、archive、renewal、accounts 和 DNS 凭据，不能只看
+  当前证书文件是否存在。
+
+## 2026-10-29：Y 服务本机正常但公网 80/443 超时
+
+**现象**
+
+- Y 本机 Nginx 监听 `0.0.0.0:80/443`，回环 HTTPS readiness 正常。
+- 开发机、W、C 及三个外部检测节点连接 Y 的 80/443 全部超时。
+
+**原因与处理**
+
+- Ubuntu UFW 实际未启用，问题位于阿里云安全组；放行入方向 TCP 80/443 后恢复。
+- 切换 DNS 前必须从至少一个非目标节点验证公网端口，不能只测 `127.0.0.1`。
+
 ## 2026-10-29：付款卡片到达延迟 0~30 秒（自动发货"不快"），WS 一条会话只同步一次
 
 **现象**

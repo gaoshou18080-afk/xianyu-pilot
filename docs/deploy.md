@@ -526,3 +526,148 @@ sudo systemctl reload nginx
 
 不得停止 C 的 Nginx 或 PHP。回滚时先停 W 的 Worker/Crawler，再恢复 C 的
 Nginx 站点和四个 xianyu 单元；禁止两个节点同时消费同一批闲鱼账号。
+
+## 版本 `8fc2fc8` <=> 服务器 W 到 Y 完整迁移（2026-10-29，当前生产）
+
+目标节点最终确认为服务器 Y `47.114.95.251`。W `104.234.177.211` 是先前误切换
+产生的中间节点，本次已将闲鱼项目完整迁到 Y，并从 W 清理全部闲鱼专用资源。
+迁移期间未停止 W 的 Nginx/MySQL/PHP，也未修改 W 其他站点。
+
+### 1. 源端停写与备份
+
+```sh
+# W
+sudo systemctl stop xianyu-crawler xianyu-worker xianyu-api
+sudo systemctl disable xianyu-crawler xianyu-worker xianyu-api
+sudo systemctl stop xianyu-redis
+sudo systemctl disable xianyu-redis
+
+# 备份包含项目、MySQL、Redis、Node、Playwright 和证书
+ls -lh /var/www/vm_share/yuenan/xianyu-w-to-y-20261029/
+```
+
+本地备份目录：
+`/var/www/vm_share/yuenan/xianyu-w-to-y-20261029/`。项目、数据库、Redis、Node
+和证书包通过 SHA-256 校验；Playwright 包清单值与实际包不一致，但 Y 上真实
+Chromium 启动和页面加载测试通过，最终以运行态验收为准。
+
+### 2. Y 系统运行时
+
+```sh
+# Y
+apt-get update
+fallocate -l 2G /swapfile
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
+grep -q '^/swapfile ' /etc/fstab ||
+  echo '/swapfile none swap sw 0 0' >>/etc/fstab
+
+install -d -o guanli -g guanli -m 0755 /var/www/xianyu
+# 恢复项目包到 /var/www/xianyu
+# Node 22.23.1 恢复至 /opt/node22
+# Python 3.12.16 恢复至 /opt/python3.12
+```
+
+Y 使用 `/var/www/xianyu/.venv`、`/opt/node22/bin/node` 和独立 Crawler
+`node_modules`；服务器上不执行前后端构建。
+
+### 3. MySQL、Redis 与证书
+
+MySQL 导入后确认 73 张表、45 个迁移，关键数据与 W 一致：聊天消息 1552、
+订单 298、发货尝试 54、卡密 212。
+
+应用使用 `127.0.0.1` 连接，但 MySQL 按反向名称匹配到
+`xianyu_app@localhost`，因此权限必须建在该身份上，且只能授权本库：
+
+```sql
+CREATE USER IF NOT EXISTS 'xianyu_app'@'localhost'
+  IDENTIFIED BY '<mysql-app-password>';
+ALTER USER 'xianyu_app'@'localhost'
+  IDENTIFIED BY '<mysql-app-password>';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX
+  ON xianyu_opensource.* TO 'xianyu_app'@'localhost';
+FLUSH PRIVILEGES;
+```
+
+Redis 使用隔离实例 `127.0.0.1:16379`，配置、密码和数据目录分别为
+`/etc/redis/xianyu.conf`、`/etc/redis/xianyu-secret.conf`、
+`/var/lib/redis-xianyu`；Y 原有 6379 Redis 未改动。
+
+TLS 迁移除 live/archive/renewal 外，还必须迁移 ACME 账户：
+
+```sh
+ssh -i /var/www/sshkey/serv_w guanli@104.234.177.211 \
+  'echo "<sudo-password>" | sudo -S tar -C /etc/letsencrypt -cf - accounts' |
+  ssh root@47.114.95.251 'tar -C /etc/letsencrypt -xf -'
+
+# Y
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  certbot python3-certbot-dns-cloudflare
+certbot renew --cert-name xianyu.enjoygoo.win \
+  --dry-run --non-interactive --no-random-sleep-on-renew
+```
+
+### 4. systemd、Nginx 和云安全组
+
+```sh
+# Y
+systemctl daemon-reload
+systemctl enable --now xianyu-redis xianyu-api xianyu-worker xianyu-crawler
+nginx -t
+systemctl reload nginx
+```
+
+Y 阿里云安全组必须放行入方向 TCP 80/443（源 `0.0.0.0/0`）。放行前从开发机、
+W、C 和外部检测节点均确认超时；放行后 Y 的 HTTP/HTTPS 公网回源成功。
+
+### 5. DNS 切换与验收
+
+```text
+Cloudflare A: xianyu.enjoygoo.win
+104.234.177.211 -> 47.114.95.251
+TTL 60, DNS-only
+```
+
+```sh
+dig +short @1.1.1.1 xianyu.enjoygoo.win A
+dig +short @8.8.8.8 xianyu.enjoygoo.win A
+dig +short @223.5.5.5 xianyu.enjoygoo.win A
+
+curl -I --resolve xianyu.enjoygoo.win:80:47.114.95.251 \
+  http://xianyu.enjoygoo.win/
+curl -fsS --resolve xianyu.enjoygoo.win:443:47.114.95.251 \
+  https://xianyu.enjoygoo.win/readyz
+```
+
+验收结果：HTTP 301 到 HTTPS，首页与静态资源 200，`/readyz`
+`{"status":"ready"}`，登录接口 GET 返回预期的 405，证书有效期至
+2027-01-27，DNS-01 续期 dry-run 通过。
+
+### 6. W 闲鱼资源清理
+
+只在 DNS 切换和 Y 验收完成后执行，且仅删除闲鱼专用资源：
+
+```sh
+# W
+sudo systemctl disable xianyu-api xianyu-worker xianyu-crawler xianyu-redis
+sudo rm -f /etc/systemd/system/xianyu-{api,worker,crawler,redis}.service
+sudo systemctl daemon-reload
+
+sudo unlink /etc/nginx/sites-enabled/xianyu.enjoygoo.win
+sudo rm -f /etc/nginx/sites-available/xianyu.enjoygoo.win
+sudo nginx -t && sudo systemctl reload nginx
+
+sudo rm -rf /var/www/xianyu /var/lib/redis-xianyu
+sudo rm -f /etc/redis/xianyu.conf /etc/redis/xianyu-secret.conf
+sudo certbot delete --cert-name xianyu.enjoygoo.win --non-interactive
+sudo mysql -e "
+  DROP DATABASE IF EXISTS xianyu_opensource;
+  DROP USER IF EXISTS 'xianyu_app'@'127.0.0.1';
+  DROP USER IF EXISTS 'xianyu_migrate'@'127.0.0.1';
+"
+```
+
+清理后 W 无闲鱼进程、监听端口、目录、数据库、证书和站点残留；W 的
+Nginx/MySQL/PHP 仍为 active，其他站点复验 200。回滚使用本地完整备份重新部署
+到 Y 的新版本目录或经审批的独立节点，禁止与 Y 同账号双活。

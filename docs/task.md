@@ -225,3 +225,23 @@ tail -f output/local-dev/api.out.log
 - Y 当前无本项目部署。为防同一批账号双活、重复消费和重复发货，未在 Y 启动；
   Y 是接管生产还是独立账号双活需先确认。
 - 详见 `docs/report/server-w-migration-2026-10-29.md` 和 `docs/deploy.md`。
+
+## 服务器 W -> Y 最终迁移（2026-10-29，当前生产）
+
+- 用户纠正目标后，生产最终落在 Y `47.114.95.251`；W 仅作为误切换的中间节点。
+- Y 已恢复项目代码、`.env`/secrets、上传文件、MySQL（73 表/45 迁移）、Redis
+  快照，并安装 Node 22.23.1、Python 3.12.16、venv、Crawler 依赖和 Playwright
+  Chromium；真实浏览器启动测试通过。
+- Y 的 `xianyu-redis`、`xianyu-api`、`xianyu-worker`、`xianyu-crawler` 均已启用；
+  API `/health/edge-ready`、Crawler `/health`、Worker check 和公网 `/readyz`
+  全部通过。
+- MySQL 补齐 `xianyu_app@localhost` 的本库最小 DDL 权限，解决运行时创建
+  `xianyu_captcha_backoff` 被拒绝的问题。
+- Cloudflare A 记录已从 W `104.234.177.211` 切到 Y `47.114.95.251`，
+  TTL 60、DNS-only；Cloudflare、Google、阿里 DNS 均解析正确。
+- W 的闲鱼 systemd、Nginx 站点、代码、数据库、Redis、证书和专用账号已删除。
+  W 的 Nginx/MySQL/PHP 保持 active，`shop.enjoygoo.win`、`pdd.enjoygoo.win`
+  等其他站点复验均为 200。
+- C/W 均无活动闲鱼 Worker/Crawler，消除了同账号双活、重复消费和重复发货风险。
+- 账号 1 因出口 IP 改变仍为 `SESSION_EXPIRED`，需在 Y 的页面重新登录并完成滑块授权。
+- 详见 `docs/report/server-y-migration-2026-10-29.md` 和 `docs/deploy.md`。
