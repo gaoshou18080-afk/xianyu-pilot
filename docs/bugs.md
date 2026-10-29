@@ -383,3 +383,12 @@
 - `ws_startup.py`：AI 分支增加陈旧消息守卫 `ai_reply_max_message_age_seconds=900`，
   防止游标推进后一次性回放历史消息导致半夜给买家补发一堆 AI 回复（发货分支不受限）。
 - `worker.py` + `config.py`：`delivery_recovery_order_sync_enabled`（默认 true）。
+
+### 2026-10-29：服务器 C -> W 切换后账号 1 会话过期
+
+- 停写快照、Redis 和 Cookie 完整迁移后，W 启动时账号 2、3 可连接；账号 1
+  调用 Token API 返回 `FAIL_SYS_SESSION_EXPIRED::Session过期`，自动滑块也返回
+  `SESSION_EXPIRED`。
+- C 停用前账号 1 的 WS 仍在线，不能证明其 Cookie 能在新出口 IP 上重新换取 Token。
+- 处理：在业务界面重新登录账号 1 并完成滑块/授权，再观察 `WS 已连接 accountId=1`。
+- 禁止通过重新启动 C 与 W 双活来恢复该账号，否则会重复消费消息和发货。

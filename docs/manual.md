@@ -1,10 +1,10 @@
-# 服务器 C 裸机运维手册
+# 服务器 W 裸机运维手册
 
 ## 基本信息
 
 - 域名：`xianyu.enjoygoo.win`
-- 服务器：C / `104.234.174.250` / 新加坡
-- SSH：`ssh -i /var/www/sshkey/xinjiapo guanli@104.234.174.250`
+- 服务器：W / `104.234.177.211` / 新加坡
+- SSH：`ssh -i /var/www/sshkey/serv_w guanli@104.234.177.211`
 - 部署目录：`/var/www/xianyu`
 - 运行方式：裸机，不使用 Docker
 - Web：Nginx 托管 `/var/www/xianyu/apps/web/dist`
@@ -38,7 +38,7 @@ API 与 Worker 不使用 `PrivateTmp`，二者必须共享同一个系统 `/tmp`
 ## 状态检查
 
 ```sh
-ssh -i /var/www/sshkey/xinjiapo guanli@104.234.174.250
+ssh -i /var/www/sshkey/serv_w guanli@104.234.177.211
 free -m
 systemctl status --no-pager xianyu-redis xianyu-api xianyu-worker xianyu-crawler nginx
 ss -ltnp | grep -E '15177|15178|16379|:80 |:443 '
@@ -51,9 +51,9 @@ cd /var/www/xianyu/apps/api
 边缘健康检查：
 
 ```sh
-curl --resolve xianyu.enjoygoo.win:80:104.234.174.250 \
+curl --resolve xianyu.enjoygoo.win:80:104.234.177.211 \
   http://xianyu.enjoygoo.win/healthz
-curl --resolve xianyu.enjoygoo.win:80:104.234.174.250 \
+curl --resolve xianyu.enjoygoo.win:80:104.234.177.211 \
   http://xianyu.enjoygoo.win/readyz
 ```
 
@@ -91,11 +91,11 @@ git pull --ff-only
 5. 将本地 `dist` 发布包上传到对应目录并重启服务：
 
 ```sh
-scp -i /var/www/sshkey/xinjiapo -r apps/web/dist/* \
-  guanli@104.234.174.250:/var/www/xianyu/apps/web/dist/
-scp -i /var/www/sshkey/xinjiapo -r apps/crawler/dist/* \
-  guanli@104.234.174.250:/var/www/xianyu/apps/crawler/dist/
-ssh -i /var/www/sshkey/xinjiapo guanli@104.234.174.250 \
+scp -i /var/www/sshkey/serv_w -r apps/web/dist/* \
+  guanli@104.234.177.211:/var/www/xianyu/apps/web/dist/
+scp -i /var/www/sshkey/serv_w -r apps/crawler/dist/* \
+  guanli@104.234.177.211:/var/www/xianyu/apps/crawler/dist/
+ssh -i /var/www/sshkey/serv_w guanli@104.234.177.211 \
   'sudo systemctl restart xianyu-api xianyu-worker xianyu-crawler'
 ```
 
@@ -122,12 +122,12 @@ DNS 正常指向：
 
 ```sh
 dig +short @1.1.1.1 xianyu.enjoygoo.win A
-# 应返回 104.234.174.250
+# 应返回 104.234.177.211
 ```
 
-服务器 C 已使用 Cloudflare DNS-01 提前签发
+服务器 W 已使用 Cloudflare DNS-01 提前签发
 `/etc/letsencrypt/live/xianyu.enjoygoo.win/` 证书。A 记录已切换到
-`104.234.174.250`，可用以下命令复查公网：
+`104.234.177.211`，可用以下命令复查公网：
 
 ```sh
 curl -I http://xianyu.enjoygoo.win
@@ -137,7 +137,7 @@ curl -I https://xianyu.enjoygoo.win
 检查 80 到 443 跳转、证书域名和自动续期：
 
 ```sh
-echo | openssl s_client -connect 104.234.174.250:443 \
+echo | openssl s_client -connect 104.234.177.211:443 \
   -servername xianyu.enjoygoo.win 2>/dev/null |
   openssl x509 -noout -subject -issuer -dates -ext subjectAltName
 sudo certbot renew --cert-name xianyu.enjoygoo.win --dry-run

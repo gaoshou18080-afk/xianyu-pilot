@@ -416,3 +416,113 @@ systemctl is-active xianyu-api xianyu-worker
 journalctl -u xianyu-worker --since "2 min ago" -o cat | grep "delivery_recovery loop started"   # interval=15s minAge=10s
 journalctl -u xianyu-api    --since "1 min ago" -o cat | grep "同步请求已发送" | tail -10          # 每 2 秒一条
 ```
+
+## 版本 `6211b28` <=> 服务器 C 到 W 完整迁移（2026-10-29）
+
+本次是整机业务迁移，包含代码、目录、secrets、MySQL、Redis、systemd、Nginx、
+证书和 DNS 操作。W `104.234.177.211` 同时承载其他业务，全程只 reload Nginx。
+
+### 1. 源端停写与快照
+
+```sh
+ssh -i /var/www/sshkey/xinjiapo guanli@104.234.174.250
+sudo systemctl stop xianyu-crawler xianyu-worker xianyu-api
+sudo systemctl disable xianyu-crawler xianyu-worker xianyu-api xianyu-redis
+sudo systemctl stop xianyu-redis
+
+# 项目文件（排除可重建依赖）
+tar -C /var/www \
+  --exclude='xianyu/.venv' \
+  --exclude='xianyu/apps/crawler/node_modules' \
+  --exclude='xianyu/.pytest_cache' \
+  -czf /tmp/xianyu-app-final.tar.gz xianyu
+
+# MySQL 使用 secrets/mysql-migration-password，禁止把密码写入命令历史
+MYSQL_PWD="$(cat /var/www/xianyu/secrets/mysql-migration-password)" \
+  mysqldump -h127.0.0.1 -uxianyu_migrate \
+  --single-transaction --quick --routines --triggers --events \
+  --no-tablespaces --set-gtid-purged=OFF \
+  xianyu_opensource > /tmp/xianyu-final.sql
+
+# Redis 已由干净 shutdown 持久化；迁移 /var/lib/redis-xianyu
+```
+
+### 2. W 目录与运行时
+
+```sh
+sudo install -d -o guanli -g guanli -m 0755 /var/www/xianyu
+# 将项目包解压到 /var/www
+cd /var/www/xianyu
+python3 -m venv .venv
+.venv/bin/pip install -r apps/api/requirements.txt
+cd apps/crawler
+npm ci --omit=dev
+npm exec playwright install chromium
+```
+
+Node.js 固定为 `22.23.1`，装在 `/opt/node22`；不要使用 W 上其他项目的运行时。
+
+### 3. MySQL 与 Redis
+
+```sql
+CREATE DATABASE xianyu_opensource
+  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER 'xianyu_app'@'127.0.0.1' IDENTIFIED BY '<mysql-app-password>';
+CREATE USER 'xianyu_migrate'@'127.0.0.1'
+  IDENTIFIED BY '<mysql-migration-password>';
+GRANT SELECT, INSERT, UPDATE, DELETE ON xianyu_opensource.*
+  TO 'xianyu_app'@'127.0.0.1';
+GRANT ALL PRIVILEGES ON xianyu_opensource.*
+  TO 'xianyu_migrate'@'127.0.0.1';
+```
+
+导入 `/tmp/xianyu-final.sql` 后确认 73 张表、45 个迁移。
+
+```sh
+sudo install -m 0640 -o root -g redis \
+  deploy/server-c/xianyu-redis.conf /etc/redis/xianyu.conf
+sudo sh -c 'umask 0137; printf "requirepass %s\n" \
+  "$(cat /var/www/xianyu/secrets/redis-password)" \
+  > /etc/redis/xianyu-secret.conf'
+# 将 C 的 /var/lib/redis-xianyu 恢复到 W
+sudo systemctl enable --now xianyu-redis
+```
+
+### 4. systemd 与 Nginx
+
+```sh
+sudo install -m 0644 deploy/server-c/xianyu-{api,worker,crawler,redis}.service \
+  /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now \
+  xianyu-redis xianyu-api xianyu-worker xianyu-crawler
+
+sudo install -m 0644 deploy/server-c/nginx-xianyu.enjoygoo.win.conf \
+  /etc/nginx/sites-available/xianyu.enjoygoo.win
+sudo ln -sfn /etc/nginx/sites-available/xianyu.enjoygoo.win \
+  /etc/nginx/sites-enabled/xianyu.enjoygoo.win
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+证书在 W 使用 `/etc/letsencrypt/cloudflare.ini` 通过 DNS-01 独立签发；A 记录
+切换前先用 `curl --resolve xianyu.enjoygoo.win:443:104.234.177.211` 验收。
+
+### 5. DNS 与源端收尾
+
+```text
+Cloudflare A: xianyu.enjoygoo.win
+104.234.174.250 -> 104.234.177.211
+TTL 60, DNS-only
+```
+
+确认 W 验收通过后，在 C 移除 xianyu 站点并 reload Nginx：
+
+```sh
+sudo unlink /etc/nginx/sites-enabled/xianyu.enjoygoo.win
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+不得停止 C 的 Nginx 或 PHP。回滚时先停 W 的 Worker/Crawler，再恢复 C 的
+Nginx 站点和四个 xianyu 单元；禁止两个节点同时消费同一批闲鱼账号。

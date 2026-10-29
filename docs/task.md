@@ -211,3 +211,17 @@ tail -f output/local-dev/api.out.log
 - 附带发现：商品 `1096808224767`（最新版量卡不限时3亿额度，goods 29）**没有
   `delivery_goods_config` 配置行**，订单 5127565466048278100（05:52 付款）因此
   `delivery_mode_unavailable` 未发货 —— 属配置缺失，不是代码问题。
+
+## 服务器 C -> W 完整迁移（2026-10-29，已完成 W 切换）
+
+- 生产已从 C `104.234.174.250` 迁到 W `104.234.177.211`，代码版本 `6211b28`。
+- 已完成项目文件、`.env`/secrets、上传文件、MySQL（73 表/45 迁移）和 Redis
+  停写快照迁移；W 已重新安装 Node 22、Python venv、Crawler 依赖和 Playwright。
+- W 的四个 xianyu systemd 单元已启用，API ready、Worker check、Crawler ready
+  均通过；Cloudflare A 记录已切到 W，W 已独立签发 HTTPS 证书。
+- C 的四个 xianyu 单元已停止并取消开机，xianyu Nginx 站点已移除；C 的 Nginx、
+  PHP 7.4/PHP 8.4 和其他业务保持运行。
+- 账号 1 切换出口 IP 后 `SESSION_EXPIRED`，账号 2/3 已连接；账号 1 需重新授权。
+- Y 当前无本项目部署。为防同一批账号双活、重复消费和重复发货，未在 Y 启动；
+  Y 是接管生产还是独立账号双活需先确认。
+- 详见 `docs/report/server-w-migration-2026-10-29.md` 和 `docs/deploy.md`。
